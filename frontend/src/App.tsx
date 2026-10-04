@@ -32,6 +32,7 @@ import ArchiveIcon from '@mui/icons-material/Archive';
 import { ROUTES } from './router/routes';
 import { initDatabase } from './utils/db';
 import { refreshAll, subscribeStoreRefresh } from './stores';
+import { setupCrossTabSync } from './utils/events';
 import { useAppSelector } from './hooks/useAppStore';
 import { selectFaultCounts } from './stores/faultStore';
 import { selectWindowStats } from './stores/workOrderStore';
@@ -59,14 +60,17 @@ export default function App() {
 
   useEffect(() => {
     let cancelled = false;
+    let tearDownCrossTab: (() => void) | null = null;
     void (async () => {
       await initDatabase();
       if (cancelled) return;
+      tearDownCrossTab = setupCrossTabSync();
       subscribeStoreRefresh();
       await refreshAll();
     })();
     return () => {
       cancelled = true;
+      tearDownCrossTab?.();
     };
   }, []);
 

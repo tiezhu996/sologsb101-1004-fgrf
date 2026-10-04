@@ -310,10 +310,19 @@ export default function FaultBoard() {
             startIcon={<DoneAllIcon />}
             disabled={selected.length === 0}
             onClick={async () => {
+              const rowsById = new Map(rows.map((row) => [row.id, row]));
+              let blocked = 0;
               for (const faultId of selected) {
-                await dispatch(setFaultState({ faultId, state: 'solved' }));
+                const row = rowsById.get(faultId);
+                if (!row) continue;
+                const result = await dispatch(setFaultState({ faultId, state: 'solved', baseRevision: row.revision }));
+                if (result.meta.requestStatus === 'rejected') blocked += 1;
               }
-              setToast(`已手工销号 ${selected.length} 处病害`);
+              setToast(
+                blocked > 0
+                  ? `${blocked} 处病害刚被其他标签页修改（可能已随作业单完成销号），已刷新，请核对`
+                  : `已手工销号 ${selected.length} 处病害`,
+              );
               setSelected([]);
             }}
           >
@@ -326,10 +335,19 @@ export default function FaultBoard() {
             startIcon={<UndoIcon />}
             disabled={selected.length === 0}
             onClick={async () => {
+              const rowsById = new Map(rows.map((row) => [row.id, row]));
+              let blocked = 0;
               for (const faultId of selected) {
-                await dispatch(setFaultState({ faultId, state: 'pending' }));
+                const row = rowsById.get(faultId);
+                if (!row) continue;
+                const result = await dispatch(setFaultState({ faultId, state: 'pending', baseRevision: row.revision }));
+                if (result.meta.requestStatus === 'rejected') blocked += 1;
               }
-              setToast(`已撤销销号 ${selected.length} 处病害`);
+              setToast(
+                blocked > 0
+                  ? `${blocked} 处病害刚被其他标签页修改，撤销被拦住并已刷新，请核对后重试`
+                  : `已撤销销号 ${selected.length} 处病害`,
+              );
               setSelected([]);
             }}
           >
@@ -451,10 +469,18 @@ export default function FaultBoard() {
                         size="small"
                         color={row.state === 'solved' ? 'warning' : 'success'}
                         onClick={async () => {
-                          await dispatch(
-                            setFaultState({ faultId: row.id, state: row.state === 'solved' ? 'pending' : 'solved' }),
+                          const result = await dispatch(
+                            setFaultState({
+                              faultId: row.id,
+                              state: row.state === 'solved' ? 'pending' : 'solved',
+                              baseRevision: row.revision,
+                            }),
                           );
-                          setToast(row.state === 'solved' ? '已撤销销号' : '已手工销号');
+                          if (result.meta.requestStatus === 'rejected') {
+                            setToast('操作被拦住：该病害刚被其他标签页修改，已刷新请核对后重试');
+                          } else {
+                            setToast(row.state === 'solved' ? '已撤销销号' : '已手工销号');
+                          }
                         }}
                       >
                         {row.state === 'solved' ? '撤销' : '销号'}

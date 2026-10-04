@@ -1,4 +1,5 @@
 /** 天窗时间窗重叠检测、可用时长计算与人员机具占用校验 */
+import type { WorkOrderConflictKind, WorkOrderConflictRef } from '../types/workOrder';
 
 export interface TimeWindow {
   /** 时间窗起 yyyy-MM-dd HH:mm */
@@ -80,6 +81,38 @@ export function findMachineConflicts(
     }
   }
   return [...conflicts];
+}
+
+/** 参与冲突计算的作业单最小结构 */
+export type ConflictOrder = TimeWindow & {
+  id: string;
+  code: string;
+  members: string[];
+  machines: string[];
+};
+
+/**
+ * 结构化冲突来源：时间窗重叠即记录一条 window 冲突；
+ * 时间窗重叠时，同名人员 / 同名称机具各记一条 member / machine 冲突。
+ * 用于把"退回草稿"的责任来源列给班组。
+ */
+export function findConflictRefs(target: ConflictOrder, others: ConflictOrder[]): WorkOrderConflictRef[] {
+  const refs: WorkOrderConflictRef[] = [];
+  for (const other of others) {
+    if (other.id === target.id) continue;
+    if (!isOverlap(target, other)) continue;
+    const kinds: Array<{ kind: WorkOrderConflictKind; resource: string }> = [{ kind: 'window', resource: '' }];
+    for (const member of target.members) {
+      if (other.members.includes(member)) kinds.push({ kind: 'member', resource: member });
+    }
+    for (const machine of target.machines) {
+      if (other.machines.includes(machine)) kinds.push({ kind: 'machine', resource: machine });
+    }
+    for (const item of kinds) {
+      refs.push({ orderId: other.id, orderCode: other.code, kind: item.kind, resource: item.resource });
+    }
+  }
+  return refs;
 }
 
 /**

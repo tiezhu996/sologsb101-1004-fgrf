@@ -4,6 +4,7 @@
  */
 import { createAsyncThunk, createSlice, type PayloadAction } from '@reduxjs/toolkit';
 import {
+  INITIAL_REVISION,
   ROW_REVISION,
   listFaults,
   listInspections,
@@ -15,6 +16,7 @@ import {
   putInspection,
   removeFault,
   removeInspection,
+  setFaultStateCAS,
   type FaultRow,
   type InspectionRow,
   type SwitchRow,
@@ -26,6 +28,7 @@ import type { InspectionDraft, InspectionView } from '../types/inspection';
 import { escalate } from '../utils/severity';
 import { emitChange } from '../utils/events';
 import { nowIso, uuid } from '../utils/format';
+import { nextRevision } from '../utils/concurrency';
 
 export interface FaultStateSlice {
   inspections: InspectionRow[];
@@ -110,7 +113,7 @@ export const createInspection = createAsyncThunk<
           state: 'pending' as const,
           solvedAt: null,
           createdAt: nowIso(),
-          revision: ROW_REVISION,
+          revision: INITIAL_REVISION,
         })),
       );
     }
@@ -170,7 +173,7 @@ export const createFault = createAsyncThunk<void, FaultDraft, { rejectValue: str
         state: 'pending',
         solvedAt: null,
         createdAt: nowIso(),
-        revision: ROW_REVISION,
+        revision: INITIAL_REVISION,
       });
       emitChange();
     } catch (error) {
@@ -195,6 +198,7 @@ export const updateFault = createAsyncThunk<
       type: draft.type,
       severity: draft.severity,
       sizeMm: draft.sizeMm,
+      revision: nextRevision(existing.revision),
     });
     emitChange();
   } catch (error) {
@@ -212,7 +216,7 @@ export const bulkSetSeverity = createAsyncThunk<
     const state = (getState() as { fault: FaultStateSlice }).fault;
     const rows = state.faults.filter((item) => faultIds.includes(item.id));
     if (rows.length === 0) return 0;
-    await putFaults(rows.map((item) => ({ ...item, severity })));
+    await putFaults(rows.map((item) => ({ ...item, severity, revision: nextRevision(item.revision) })));
     emitChange();
     return rows.length;
   } catch (error) {
@@ -228,7 +232,13 @@ export const bulkEscalate = createAsyncThunk<number, string[], { rejectValue: st
       const state = (getState() as { fault: FaultStateSlice }).fault;
       const rows = state.faults.filter((item) => faultIds.includes(item.id));
       if (rows.length === 0) return 0;
-      await putFaults(rows.map((item) => ({ ...item, severity: escalate(item.severity) })));
+      await putFaults(
+        rows.map((item) => ({
+          ...item,
+          severity: escalate(item.severity),
+          revision: nextRevision(item.revision),
+        })),
+      );
       emitChange();
       return rows.length;
     } catch (error) {
@@ -237,24 +247,27 @@ export const bulkEscalate = createAsyncThunk<number, string[], { rejectValue: st
   },
 );
 
-/** 手工销号 / 撤销销号 */
+/**
+ * 手工销号 / 撤销销号（按修订号 CAS）。
+ * 病害在本页打开之后被其他标签页改过（例如作业单完成已回写销号）→ 本次提交拦住，
+ * 页面重新读取最新版本，避免撤销掉别人刚写入的销号。
+ */
 export const setFaultState = createAsyncThunk<
   void,
-  { faultId: string; state: FaultState },
-  { rejectValue: string }
->('fault/setState', async ({ faultId, state }, { getState, rejectWithValue }) => {
+  { faultId: string; state: FaultState; baseRevision: number },
+  { rejectValue: { message: string; reason?: string } }
+>('fault/setState', async ({ faultId, state, baseRevision }, { rejectWithValue }) => {
   try {
-    const slice = (getState() as { fault: FaultStateSlice }).fault;
-    const existing = slice.faults.find((item) => item.id === faultId);
-    if (!existing) return;
-    await putFault({
-      ...existing,
+    await setFaultStateCAS({
+      faultId,
+      baseRevision,
       state,
       solvedAt: state === 'solved' ? nowIso() : null,
     });
     emitChange();
   } catch (error) {
-    return rejectWithValue(error instanceof Error ? error.message : '更新销号状态失败');
+    const err = error as Error & { reason?: string };
+    return rejectWithValue({ message: error instanceof Error ? error.message : '更新销号状态失败', reason: err.reason });
   }
 });
 

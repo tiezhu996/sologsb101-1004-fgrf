@@ -93,7 +93,9 @@ sologsb101-1004/
 ## 六、数据存储说明
 
 - **存储介质**：浏览器 IndexedDB，库名 **`gbrailswitch`**，通过 Dexie 4.x 封装。
-- **数据结构版本**：`utils/db.ts` 中 `DB_SCHEMA_VERSION = 2`，并登记 v1 → v2 的 `upgrade` 迁移（补齐行修订号、迁移 `faultType → type` / `faultPart → part`、`faultIds` 字符串拆分为数组、新增 `restrictions` 与 `settings` 表）。
+- **数据结构版本**：`utils/db.ts` 中 `DB_SCHEMA_VERSION = 3`：
+  - v1 → v2：补齐行修订号、迁移 `faultType → type` / `faultPart → part`、`faultIds` 字符串拆分为数组、新增 `restrictions` 与 `settings` 表；
+  - v2 → v3：作业单 / 病害的 `revision` 转为**业务修订号**（初值 1，每次写入 +1），作业单新增 `remark`（备注）、`conflictRefs`（退回草稿时的冲突来源快照），状态新增 `draft`（草稿，有冲突），并新增 `pendingCommits` 预提交日志表。
 - **数据表**：
 
   | 表名 | 实体 | 主要索引 |
@@ -105,9 +107,15 @@ sologsb101-1004/
   | `workOrders` | 天窗作业单 | id / code / state / windowStart / leader |
   | `restrictions` | 封锁 / 慢行条件 | id / yardId / switchCode |
   | `settings` | 自定义字典 | id |
+  | `pendingCommits` | 预提交日志（原子提交回滚点） | id / kind |
 
-- **首屏自动播种**：`initDatabase()` 在 `yards` 表为空时写入演示数据（幂等）——2 个站场 × 各 4 组道岔 × 1~2 次巡检 × 每次 0~3 条病害 + 3 张天窗作业单（含 1 张刻意与人员时间窗冲突）+ 2 条封锁条件，父子记录通过 `yardId / switchId / inspectionId / faultIds` 互相引用。
-- **跨页状态**：全部放在 Redux Toolkit store（`yardStore / switchStore / faultStore / workOrderStore`），页面只读 store；Dexie 写入后由 `utils/events.ts` 广播，store 自动重新拉取。
+- **多标签并发（乐观锁）**：作业单与病害的每次保存都按修订号（revision）提交——页面打开编辑时记住基版号，落库事务内 CAS 比对，其他标签页先行保存导致修订号不一致时提交被拦住并重新读取。
+  - 病害已被别的作业单占用：当前页面提交被硬拦截并列出占用来源（一张作业单内多处病害与其他单重复时逐条列出）；
+  - 时间窗 / 人员 / 机具一有冲突：本单落为 `draft`（草稿），受影响的其他**未下达**作业单一并退回草稿，结构化记录冲突来源（哪张单、时间窗还是人员/机具、资源名称）；冲突解除后重新保存自动回到「待编排」；已下达及以后的作业单不被退回；
+  - 跨标签同步：`utils/events.ts` 通过 BroadcastChannel 广播，并在页面重新可见 / 获得焦点时兜底刷新；编辑中的作业单被其他标签保存时，以「打开时基线 / 本页草稿 / 远端最新」做三方合并——未冲突字段（含备注）自动合并，两边都改的字段两边内容都保留，弹窗内人工选定后才能再保存（见 `utils/concurrency.ts`）。
+- **完成原子提交**：作业单推进到「已完成」时，作业单状态与关联病害销号在**同一次提交**里写入，采用「写预提交日志 → 业务事务写作业单与病害 → 删日志」两阶段提交。任一步失败（含浏览器崩溃后重开），`initDatabase()` 都按 `pendingCommits` 日志把作业单与病害整体恢复到提交前，不留下半成品（逻辑验证：`scripts/verify-concurrency.mts`）。
+- **首屏自动播种**：`initDatabase()` 先恢复未完成的预提交，再在 `yards` 表为空时写入演示数据（幂等）——2 个站场 × 各 4 组道岔 × 1~2 次巡检 × 每次 0~3 条病害 + 3 张天窗作业单（含 1 张刻意与人员时间窗冲突、落为草稿）+ 2 条封锁条件，父子记录通过 `yardId / switchId / inspectionId / faultIds` 互相引用。
+- **跨页状态**：全部放在 Redux Toolkit store（`yardStore / switchStore / faultStore / workOrderStore`），页面只读 store；Dexie 写入后由 `utils/events.ts` 广播（同标签内存监听 + 跨标签 BroadcastChannel），store 自动重新拉取。
 - **数据不出浏览器**：容器无状态，不挂载卷、不使用数据库服务。
 
 ## 七、本地开发

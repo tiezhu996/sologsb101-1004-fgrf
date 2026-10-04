@@ -1,9 +1,15 @@
 /**
  * /workorders 天窗作业单编排
  * 勾选病害成单、分配时间窗 / 人员 / 机具并做冲突校验；
- * 消费 WorkOrder、Fault 与 <StatBadge>。
+ *
+ * 多标签协作：
+ * - 保存按修订号提交：其他标签先改过则提交被拦住，自动重新读取并做三方合并；
+ * - 病害已被别的作业单占用 → 提交被硬拦截并列出占用来源；
+ * - 时间窗 / 人员 / 机具一有冲突，本单与受影响的未下达作业单退回草稿并列出冲突来源；
+ * - 编辑过程中切回页面读到其他标签的新版本：未冲突的字段（含备注）自动合并，
+ *   两边都改的字段两边内容都保留，在冲突面板里人工选定后才能再保存。
  */
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import {
   Alert,
@@ -42,20 +48,22 @@ import WarningAmberIcon from '@mui/icons-material/WarningAmber';
 import { useAppDispatch, useAppSelector } from '../hooks/useAppStore';
 import {
   clearFaultSelection,
-  createWorkOrder,
   deleteWorkOrder,
   selectPlanableFaults,
   selectWindowStats,
   selectWorkOrderViews,
   setFaultSelection,
-  updateWorkOrder,
+  saveWorkOrderThunk,
 } from '../stores/workOrderStore';
 import {
   MACHINE_LIBRARY,
   MEMBER_LIBRARY,
+  WORK_ORDER_CONFLICT_KIND_LABEL,
   WORK_ORDER_STATE_FLOW,
   WORK_ORDER_STATE_LABEL,
   buildWorkOrderCode,
+  type WorkOrderConflictRef,
+  type WorkOrderDraft,
   type WorkOrderView,
 } from '../types/workOrder';
 import { FAULT_SEVERITY_LABEL, type FaultSeverity } from '../types/fault';
@@ -63,19 +71,18 @@ import { ROUTES } from '../router/routes';
 import { endTimeOf, findMachineConflicts, findMemberConflicts, formatDuration, nowDateTime, windowMinutes } from '../utils/window';
 import { share } from '../utils/format';
 import { SEVERITY_HEX } from '../utils/severity';
+import {
+  WORK_ORDER_FIELD_LABEL,
+  mergeWorkOrderDraft,
+  resolveConflict,
+  type FieldConflict,
+} from '../utils/concurrency';
+import type { OccupiedFault } from '../utils/db';
 import StatBadge from '../components/common/StatBadge';
 import EmptyPanel from '../components/common/EmptyPanel';
 import SeverityTag from '../components/common/SeverityTag';
 
-interface OrderFormState {
-  code: string;
-  windowStart: string;
-  windowEnd: string;
-  leader: string;
-  machines: string[];
-  members: string[];
-  faultIds: string[];
-}
+interface OrderFormState extends WorkOrderDraft {}
 
 function defaultForm(): OrderFormState {
   const start = `${nowDateTime().slice(0, 10)} 09:00`;
@@ -87,7 +94,57 @@ function defaultForm(): OrderFormState {
     machines: ['道尺', '捣固镐'],
     members: [MEMBER_LIBRARY[0], MEMBER_LIBRARY[1]],
     faultIds: [],
+    remark: '',
   };
+}
+
+interface DialogState {
+  open: boolean;
+  editingId: string | null;
+  form: OrderFormState;
+  /** 打开编辑时的基版修订号（提交时做 CAS） */
+  baseRevision: number;
+  /** 打开编辑时的内容快照（三方合并的 base） */
+  baseForm: OrderFormState;
+  /** 三方合并后待人工选定的字段冲突 */
+  conflicts: FieldConflict[];
+  /** 是否已自动接收过其他标签的新版本（用于提示） */
+  mergedHint: string;
+}
+
+function closedDialog(): DialogState {
+  return {
+    open: false,
+    editingId: null,
+    form: defaultForm(),
+    baseRevision: 0,
+    baseForm: defaultForm(),
+    conflicts: [],
+    mergedHint: '',
+  };
+}
+
+function conflictText(refs: WorkOrderConflictRef[]): string {
+  const lines: string[] = [];
+  const byOrder = new Map<string, WorkOrderConflictRef[]>();
+  for (const ref of refs) {
+    const list = byOrder.get(ref.orderCode) ?? [];
+    list.push(ref);
+    byOrder.set(ref.orderCode, list);
+  }
+  for (const [code, list] of byOrder) {
+    const kinds = list.map((ref) => {
+      const label = WORK_ORDER_CONFLICT_KIND_LABEL[ref.kind];
+      return ref.resource ? `${label}（${ref.resource}）` : label;
+    });
+    lines.push(`${code}：${[...new Set(kinds)].join('、')}`);
+  }
+  return lines.join('；');
+}
+
+function formatFieldValue(value: string | string[]): string {
+  if (Array.isArray(value)) return value.length > 0 ? value.join('、') : '（空）';
+  return value.trim() ? value : '（空）';
 }
 
 export default function WorkOrderPlan() {
@@ -100,11 +157,9 @@ export default function WorkOrderPlan() {
 
   const [toast, setToast] = useState('');
   const [selectedFaults, setSelectedFaults] = useState<string[]>([]);
-  const [dialog, setDialog] = useState<{ open: boolean; editingId: string | null; form: OrderFormState }>({
-    open: false,
-    editingId: null,
-    form: defaultForm(),
-  });
+  const [dialog, setDialog] = useState<DialogState>(closedDialog());
+  /** 合并去重保护：同一条远端版本只处理一次 */
+  const mergedRevisionsRef = useRef<Set<string>>(new Set());
 
   /** 当前表单的冲突预检结果 */
   const draftConflicts = useMemo(() => {
@@ -144,26 +199,86 @@ export default function WorkOrderPlan() {
     };
   }, [allOrderRows, dialog]);
 
+  /**
+   * 编辑过程中其他标签页保存了同一作业单（修订号变化）：
+   * 以打开时的 base、本页 form、远端最新 row 做三方合并。
+   */
+  useEffect(() => {
+    if (!dialog.open || !dialog.editingId) return;
+    const remote = allOrderRows.find((item) => item.id === dialog.editingId);
+    if (!remote) return;
+    const mergeKey = `${remote.id}@${remote.revision}`;
+    if (remote.revision === dialog.baseRevision || mergedRevisionsRef.current.has(mergeKey)) return;
+
+    const remoteForm: OrderFormState = {
+      code: remote.code,
+      faultIds: remote.faultIds,
+      windowStart: remote.windowStart,
+      windowEnd: remote.windowEnd,
+      leader: remote.leader,
+      machines: remote.machines,
+      members: remote.members,
+      remark: remote.remark,
+    };
+    const result = mergeWorkOrderDraft(dialog.baseForm, dialog.form, remoteForm);
+    mergedRevisionsRef.current.add(mergeKey);
+    setDialog((prev) => ({
+      ...prev,
+      form: result.merged,
+      baseRevision: remote.revision,
+      baseForm: remoteForm,
+      conflicts: result.conflicts,
+      mergedHint:
+        result.conflicts.length > 0
+          ? `其他标签页也修改了该作业单：${result.conflicts
+              .map((item) => WORK_ORDER_FIELD_LABEL[item.field])
+              .join('、')} 两边内容不同，请在下方人工选定。`
+          : '已读取其他标签页保存的最新版本，未冲突的修改（含备注）已自动合并。',
+    }));
+  }, [dialog, allOrderRows]);
+
   const openCreate = (): void => {
     const next = defaultForm();
     next.faultIds = selectedFaults;
-    setDialog({ open: true, editingId: null, form: next });
+    mergedRevisionsRef.current = new Set();
+    setDialog({ ...closedDialog(), open: true, form: next, baseForm: { ...next } });
   };
 
   const openEdit = (order: WorkOrderView): void => {
+    const form: OrderFormState = {
+      code: order.code,
+      windowStart: order.windowStart,
+      windowEnd: order.windowEnd,
+      leader: order.leader,
+      machines: order.machines,
+      members: order.members,
+      faultIds: order.faultIds,
+      remark: order.remark,
+    };
+    mergedRevisionsRef.current = new Set([`${order.id}@${order.revision}`]);
     setDialog({
       open: true,
       editingId: order.id,
-      form: {
-        code: order.code,
-        windowStart: order.windowStart,
-        windowEnd: order.windowEnd,
-        leader: order.leader,
-        machines: order.machines,
-        members: order.members,
-        faultIds: order.faultIds,
-      },
+      form,
+      baseRevision: order.revision,
+      baseForm: { ...form },
+      conflicts: [],
+      mergedHint: '',
     });
+  };
+
+  const patchForm = (patch: Partial<OrderFormState>): void => {
+    setDialog((prev) => ({ ...prev, form: { ...prev.form, ...patch } }));
+  };
+
+  const chooseResolution = (conflict: FieldConflict, resolution: 'local' | 'remote'): void => {
+    setDialog((prev) => ({
+      ...prev,
+      form: resolveConflict(prev.form, conflict, resolution),
+      conflicts: prev.conflicts.map((item) =>
+        item.field === conflict.field ? { ...item, resolution } : item,
+      ),
+    }));
   };
 
   const submit = async (): Promise<void> => {
@@ -179,24 +294,55 @@ export default function WorkOrderPlan() {
       setToast('天窗止必须晚于天窗起');
       return;
     }
-    if (dialog.editingId) {
-      await dispatch(updateWorkOrder({ id: dialog.editingId, draft: dialog.form }));
-      setToast('作业单已更新');
-    } else {
-      try {
-        const result = await dispatch(createWorkOrder(dialog.form)).unwrap();
-        setToast(
-          result.conflicts.length > 0
-            ? `作业单已创建，但与 ${result.conflicts.join('、')} 时间窗重叠，请复核`
-            : '作业单已创建',
+    if (dialog.conflicts.some((item) => item.resolution === null)) {
+      setToast('还有字段冲突未选定，请保留本页或采用其他标签页的内容后再保存');
+      return;
+    }
+
+    try {
+      const result = await dispatch(
+        saveWorkOrderThunk({
+          id: dialog.editingId,
+          baseRevision: dialog.editingId ? dialog.baseRevision : undefined,
+          draft: dialog.form,
+        }),
+      ).unwrap();
+
+      const parts: string[] = [];
+      parts.push(result.created ? '作业单已创建' : '作业单已更新');
+      if (result.selfConflictRefs.length > 0) {
+        parts.push(`本单存在冲突已退回草稿：${conflictText(result.selfConflictRefs)}`);
+      } else if (result.order.state === 'planned' && dialog.editingId) {
+        parts.push('冲突已解除，作业单恢复为待编排');
+      }
+      if (result.cascaded.length > 0) {
+        parts.push(
+          `受影响退回草稿 ${result.cascaded.length} 张：${result.cascaded
+            .map((item) => `${item.code}（${conflictText(item.conflictRefs)}）`)
+            .join('；')}`,
         );
-      } catch (error) {
-        setToast(`建单失败：${error instanceof Error ? error.message : '未知错误'}`);
+      }
+      setToast(parts.join('；'));
+    } catch (error) {
+      const rejected = error as { message?: string; reason?: string; details?: Record<string, unknown> };
+      if (rejected.reason === 'fault-occupied') {
+        const occupied = (rejected.details?.occupied ?? []) as OccupiedFault[];
+        setToast(
+          `提交被拦住：${occupied
+            .map((item) => `病害 ${item.faultId} 已在作业单 ${item.orderCode} 中`)
+            .join('；')}`,
+        );
         return;
       }
-      dispatch(clearFaultSelection());
+      if (rejected.reason === 'stale-work-order') {
+        setToast('提交被拦住：该作业单刚被其他标签页保存，已为你重新读取，请核对合并提示后再保存');
+        return;
+      }
+      setToast(`保存失败：${rejected.message ?? '未知错误'}`);
+      return;
     }
-    setDialog((prev) => ({ ...prev, open: false, editingId: null }));
+    dispatch(clearFaultSelection());
+    setDialog(closedDialog());
   };
 
   return (
@@ -208,6 +354,7 @@ export default function WorkOrderPlan() {
           </Typography>
           <Typography variant="body2" color="text.secondary">
             勾选待修病害成单，分配天窗时间窗、负责人、作业人员与机具，并做时间窗 / 人员 / 机具三重冲突校验。
+            保存按修订号提交，多标签同时作业不会互相覆盖。
           </Typography>
         </Box>
         <Stack direction="row" spacing={1}>
@@ -236,11 +383,11 @@ export default function WorkOrderPlan() {
         </Grid>
         <Grid item xs={12} sm={6} md={3}>
           <StatBadge
-            title="时间窗冲突"
-            value={stats.conflictCount}
+            title="草稿（有冲突）"
+            value={stats.draftCount}
             suffix="张"
-            color={stats.conflictCount > 0 ? '#d32f2f' : '#2e7d32'}
-            hint="同一时间窗内存在重叠作业单"
+            color={stats.draftCount > 0 ? '#d32f2f' : '#2e7d32'}
+            hint="冲突未解除前不能下达"
           />
         </Grid>
         <Grid item xs={12} sm={6} md={3}>
@@ -329,7 +476,8 @@ export default function WorkOrderPlan() {
                               setSelectedFaults([item.id]);
                               const next = defaultForm();
                               next.faultIds = [item.id];
-                              setDialog({ open: true, editingId: null, form: next });
+                              mergedRevisionsRef.current = new Set();
+                              setDialog({ ...closedDialog(), open: true, form: next, baseForm: { ...next } });
                             }}
                           >
                             单独建单
@@ -354,15 +502,35 @@ export default function WorkOrderPlan() {
             ) : (
               <Stack spacing={1.25}>
                 {orders.map((order) => (
-                  <Paper key={order.id} variant="outlined" sx={{ p: 1.25 }}>
+                  <Paper
+                    key={order.id}
+                    variant="outlined"
+                    sx={{
+                      p: 1.25,
+                      borderColor: order.state === 'draft' ? '#d32f2f' : undefined,
+                      borderWidth: order.state === 'draft' ? 2 : undefined,
+                    }}
+                  >
                     <Stack direction="row" justifyContent="space-between" alignItems="center" flexWrap="wrap" useFlexGap>
                       <Stack direction="row" spacing={1} alignItems="center" flexWrap="wrap" useFlexGap>
                         <Typography variant="subtitle2" fontWeight={600}>
                           {order.code}
                         </Typography>
-                        <Chip size="small" label={WORK_ORDER_STATE_LABEL[order.state]} color={order.state === 'done' ? 'success' : 'default'} />
+                        <Chip
+                          size="small"
+                          label={WORK_ORDER_STATE_LABEL[order.state]}
+                          color={
+                            order.state === 'done'
+                              ? 'success'
+                              : order.state === 'draft'
+                                ? 'error'
+                                : order.state === 'working'
+                                  ? 'info'
+                                  : 'default'
+                          }
+                        />
                         {order.conflict ? (
-                          <Tooltip title={`与 ${order.conflictCodes.join('、')} 时间窗重叠`}>
+                          <Tooltip title={conflictText(order.liveConflictRefs)}>
                             <Chip size="small" color="error" icon={<WarningAmberIcon />} label="时间窗冲突" />
                           </Tooltip>
                         ) : null}
@@ -371,15 +539,19 @@ export default function WorkOrderPlan() {
                       </Stack>
                       <Stack direction="row" spacing={0.5}>
                         <Button size="small" startIcon={<EditIcon />} onClick={() => openEdit(order)}>
-                          编辑
+                          {order.state === 'draft' ? '处理冲突' : '编辑'}
                         </Button>
                         <Button
                           size="small"
                           color="error"
                           startIcon={<DeleteIcon />}
                           onClick={async () => {
-                            await dispatch(deleteWorkOrder(order.id));
-                            setToast('作业单已删除');
+                            const result = await dispatch(deleteWorkOrder({ id: order.id, revision: order.revision }));
+                            if (result.meta.requestStatus === 'fulfilled') {
+                              setToast('作业单已删除');
+                            } else {
+                              setToast('删除失败：该作业单已被其他标签页修改，请刷新后重试');
+                            }
                           }}
                         >
                           删除
@@ -392,8 +564,15 @@ export default function WorkOrderPlan() {
                     </Typography>
                     <Typography variant="caption" color="text.secondary" display="block">
                       关联病害 {order.faultIds.length} 处（待销号 {order.pendingFaultCount}）· 涉及站场{' '}
-                      {order.yardNames.join('、') || '—'}
+                      {order.yardNames.join('、') || '—'} · 修订号 r{order.revision}
                     </Typography>
+                    {order.state === 'draft' && order.conflictRefs.length > 0 ? (
+                      <Alert severity="error" sx={{ mt: 0.75, py: 0.5 }} icon={<WarningAmberIcon fontSize="small" />}>
+                        <Typography variant="caption" fontWeight={600}>
+                          退回草稿的冲突来源：{conflictText(order.conflictRefs)}
+                        </Typography>
+                      </Alert>
+                    ) : null}
                     <Stack direction="row" spacing={0.5} flexWrap="wrap" useFlexGap mt={0.75}>
                       {order.members.map((member) => (
                         <Chip key={member} size="small" variant="outlined" label={`人 ${member}`} />
@@ -408,6 +587,11 @@ export default function WorkOrderPlan() {
                       ))}
                       {order.faultLabels.length > 4 ? <Chip size="small" label={`+${order.faultLabels.length - 4}`} /> : null}
                     </Stack>
+                    {order.remark.trim() ? (
+                      <Typography variant="caption" color="text.secondary" display="block" mt={0.75}>
+                        备注：{order.remark}
+                      </Typography>
+                    ) : null}
                     {WORK_ORDER_STATE_FLOW[order.state].length > 0 ? (
                       <Typography variant="caption" color="text.secondary" display="block" mt={0.5}>
                         下一步可推进为：{WORK_ORDER_STATE_FLOW[order.state].map((item) => WORK_ORDER_STATE_LABEL[item]).join('、')}
@@ -422,8 +606,15 @@ export default function WorkOrderPlan() {
       </Grid>
 
       {/* 作业单表单 */}
-      <Dialog open={dialog.open} onClose={() => setDialog((prev) => ({ ...prev, open: false }))} fullWidth maxWidth="md">
-        <DialogTitle>{dialog.editingId ? '编辑天窗作业单' : '新建天窗作业单'}</DialogTitle>
+      <Dialog open={dialog.open} onClose={() => setDialog(closedDialog())} fullWidth maxWidth="md">
+        <DialogTitle>
+          {dialog.editingId ? '编辑天窗作业单' : '新建天窗作业单'}
+          {dialog.editingId ? (
+            <Typography component="span" variant="caption" color="text.secondary" sx={{ ml: 1 }}>
+              基版修订号 r{dialog.baseRevision}
+            </Typography>
+          ) : null}
+        </DialogTitle>
         <DialogContent dividers>
           <Grid container spacing={2} mt={0.5}>
             <Grid item xs={12} md={4}>
@@ -432,7 +623,7 @@ export default function WorkOrderPlan() {
                 size="small"
                 label="作业单编号"
                 value={dialog.form.code}
-                onChange={(event) => setDialog((prev) => ({ ...prev, form: { ...prev.form, code: event.target.value } }))}
+                onChange={(event) => patchForm({ code: event.target.value })}
               />
             </Grid>
             <Grid item xs={12} md={4}>
@@ -443,16 +634,13 @@ export default function WorkOrderPlan() {
                 label="天窗起"
                 InputLabelProps={{ shrink: true }}
                 value={dialog.form.windowStart.replace(' ', 'T')}
-                onChange={(event) =>
-                  setDialog((prev) => ({
-                    ...prev,
-                    form: {
-                      ...prev.form,
-                      windowStart: event.target.value.replace('T', ' '),
-                      windowEnd: endTimeOf(event.target.value.replace('T', ' '), draftConflicts.duration || 120),
-                    },
-                  }))
-                }
+                onChange={(event) => {
+                  const start = event.target.value.replace('T', ' ');
+                  patchForm({
+                    windowStart: start,
+                    windowEnd: endTimeOf(start, draftConflicts.duration || 120),
+                  });
+                }}
               />
             </Grid>
             <Grid item xs={12} md={4}>
@@ -463,12 +651,7 @@ export default function WorkOrderPlan() {
                 label="天窗止"
                 InputLabelProps={{ shrink: true }}
                 value={dialog.form.windowEnd.replace(' ', 'T')}
-                onChange={(event) =>
-                  setDialog((prev) => ({
-                    ...prev,
-                    form: { ...prev.form, windowEnd: event.target.value.replace('T', ' ') },
-                  }))
-                }
+                onChange={(event) => patchForm({ windowEnd: event.target.value.replace('T', ' ') })}
               />
             </Grid>
             <Grid item xs={12} md={4}>
@@ -477,7 +660,7 @@ export default function WorkOrderPlan() {
                 <Select
                   label="负责人"
                   value={dialog.form.leader}
-                  onChange={(event) => setDialog((prev) => ({ ...prev, form: { ...prev.form, leader: event.target.value } }))}
+                  onChange={(event) => patchForm({ leader: event.target.value })}
                 >
                   {[...new Set([...MEMBER_LIBRARY, ...dialog.form.members])].map((name) => (
                     <MenuItem key={name} value={name}>
@@ -496,13 +679,9 @@ export default function WorkOrderPlan() {
                   value={dialog.form.members}
                   input={<OutlinedInput label="作业人员" />}
                   onChange={(event) =>
-                    setDialog((prev) => ({
-                      ...prev,
-                      form: {
-                        ...prev.form,
-                        members: typeof event.target.value === 'string' ? [event.target.value] : event.target.value,
-                      },
-                    }))
+                    patchForm({
+                      members: typeof event.target.value === 'string' ? [event.target.value] : event.target.value,
+                    })
                   }
                   renderValue={(selected) => (selected as string[]).join('、')}
                 >
@@ -524,13 +703,9 @@ export default function WorkOrderPlan() {
                   value={dialog.form.machines}
                   input={<OutlinedInput label="机具清单" />}
                   onChange={(event) =>
-                    setDialog((prev) => ({
-                      ...prev,
-                      form: {
-                        ...prev.form,
-                        machines: typeof event.target.value === 'string' ? [event.target.value] : event.target.value,
-                      },
-                    }))
+                    patchForm({
+                      machines: typeof event.target.value === 'string' ? [event.target.value] : event.target.value,
+                    })
                   }
                   renderValue={(selected) => (selected as string[]).join('、')}
                 >
@@ -553,13 +728,9 @@ export default function WorkOrderPlan() {
                   value={dialog.form.faultIds}
                   input={<OutlinedInput label="关联病害" />}
                   onChange={(event) =>
-                    setDialog((prev) => ({
-                      ...prev,
-                      form: {
-                        ...prev.form,
-                        faultIds: typeof event.target.value === 'string' ? [event.target.value] : event.target.value,
-                      },
-                    }))
+                    patchForm({
+                      faultIds: typeof event.target.value === 'string' ? [event.target.value] : event.target.value,
+                    })
                   }
                   renderValue={(selected) => `已选 ${(selected as string[]).length} 处病害`}
                 >
@@ -567,7 +738,7 @@ export default function WorkOrderPlan() {
                     ...planable,
                     ...dialog.form.faultIds
                       .filter((id) => !planable.some((item) => item.id === id))
-                      .map((id) => ({ id, label: `已编排病害 ${id}`, severity: 'medium' as FaultSeverity, state: 'pending' })),
+                      .map((id) => ({ id, label: `本单病害 ${id}`, severity: 'medium' as FaultSeverity, state: 'pending' })),
                   ].map((item) => (
                     <MenuItem key={item.id} value={item.id}>
                       <Checkbox checked={dialog.form.faultIds.includes(item.id)} />
@@ -579,6 +750,65 @@ export default function WorkOrderPlan() {
             </Grid>
 
             <Grid item xs={12}>
+              <TextField
+                fullWidth
+                size="small"
+                multiline
+                minRows={2}
+                label="备注（多标签同时编辑时，未冲突的备注改动会自动合并）"
+                value={dialog.form.remark}
+                onChange={(event) => patchForm({ remark: event.target.value })}
+              />
+            </Grid>
+
+            {dialog.mergedHint ? (
+              <Grid item xs={12}>
+                <Alert severity={dialog.conflicts.some((item) => item.resolution === null) ? 'warning' : 'info'}>
+                  {dialog.mergedHint}
+                </Alert>
+              </Grid>
+            ) : null}
+
+            {dialog.conflicts.length > 0 ? (
+              <Grid item xs={12}>
+                <Paper variant="outlined" sx={{ p: 1.5, borderColor: '#ed6c02' }}>
+                  <Typography variant="subtitle2" color="warning.dark" gutterBottom>
+                    字段冲突人工选定（两边内容都保留）
+                  </Typography>
+                  <Stack spacing={1.25}>
+                    {dialog.conflicts.map((conflict) => (
+                      <Stack
+                        key={conflict.field}
+                        direction={{ xs: 'column', sm: 'row' }}
+                        spacing={1}
+                        alignItems={{ sm: 'center' }}
+                      >
+                        <Chip size="small" label={WORK_ORDER_FIELD_LABEL[conflict.field]} sx={{ minWidth: 88 }} />
+                        <Button
+                          size="small"
+                          variant={conflict.resolution === 'local' ? 'contained' : 'outlined'}
+                          onClick={() => chooseResolution(conflict, 'local')}
+                          sx={{ textTransform: 'none', justifyContent: 'flex-start' }}
+                        >
+                          本页：{formatFieldValue(conflict.local)}
+                        </Button>
+                        <Button
+                          size="small"
+                          color="success"
+                          variant={conflict.resolution === 'remote' ? 'contained' : 'outlined'}
+                          onClick={() => chooseResolution(conflict, 'remote')}
+                          sx={{ textTransform: 'none', justifyContent: 'flex-start' }}
+                        >
+                          其他标签：{formatFieldValue(conflict.remote)}
+                        </Button>
+                      </Stack>
+                    ))}
+                  </Stack>
+                </Paper>
+              </Grid>
+            ) : null}
+
+            <Grid item xs={12}>
               <Alert
                 severity={draftConflicts.time.length > 0 || draftConflicts.members.length > 0 ? 'warning' : 'success'}
               >
@@ -586,6 +816,9 @@ export default function WorkOrderPlan() {
                 {draftConflicts.members.length > 0 ? draftConflicts.members.join('、') : '无'} · 机具占用{' '}
                 {draftConflicts.machines.length > 0 ? draftConflicts.machines.join('、') : '无'} · 天窗时长{' '}
                 {formatDuration(draftConflicts.duration)}
+                {draftConflicts.time.length > 0 || draftConflicts.members.length > 0 || draftConflicts.machines.length > 0
+                  ? '。保存后本单及受影响的未下达作业单将退回草稿。'
+                  : ''}
               </Alert>
             </Grid>
 
@@ -594,24 +827,14 @@ export default function WorkOrderPlan() {
                 <Button
                   size="small"
                   variant="outlined"
-                  onClick={() =>
-                    setDialog((prev) => ({
-                      ...prev,
-                      form: { ...prev.form, windowEnd: endTimeOf(prev.form.windowStart, 120) },
-                    }))
-                  }
+                  onClick={() => patchForm({ windowEnd: endTimeOf(dialog.form.windowStart, 120) })}
                 >
                   按 120 分钟设置天窗止
                 </Button>
                 <Button
                   size="small"
                   variant="outlined"
-                  onClick={() =>
-                    setDialog((prev) => ({
-                      ...prev,
-                      form: { ...prev.form, windowEnd: endTimeOf(prev.form.windowStart, 180) },
-                    }))
-                  }
+                  onClick={() => patchForm({ windowEnd: endTimeOf(dialog.form.windowStart, 180) })}
                 >
                   按 180 分钟设置天窗止
                 </Button>
@@ -626,16 +849,20 @@ export default function WorkOrderPlan() {
           </Grid>
         </DialogContent>
         <DialogActions>
-          <Button onClick={() => setDialog((prev) => ({ ...prev, open: false }))}>取消</Button>
-          <Button variant="contained" onClick={() => void submit()}>
-            保存
+          <Button onClick={() => setDialog(closedDialog())}>取消</Button>
+          <Button
+            variant="contained"
+            onClick={() => void submit()}
+            disabled={dialog.conflicts.some((item) => item.resolution === null)}
+          >
+            {dialog.conflicts.some((item) => item.resolution === null) ? '先解决字段冲突' : '保存'}
           </Button>
         </DialogActions>
       </Dialog>
 
       <Snackbar
         open={Boolean(toast)}
-        autoHideDuration={2800}
+        autoHideDuration={4000}
         onClose={() => setToast('')}
         message={toast}
         anchorOrigin={{ vertical: 'bottom', horizontal: 'center' }}

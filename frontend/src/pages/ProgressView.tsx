@@ -45,7 +45,7 @@ import StatBadge from '../components/common/StatBadge';
 import EmptyPanel from '../components/common/EmptyPanel';
 import FilterBar, { useFilterValues, useKeywordFilter } from '../components/common/FilterBar';
 
-const STATE_ORDER: WorkOrderState[] = ['planned', 'issued', 'working', 'done'];
+const STATE_ORDER: WorkOrderState[] = ['draft', 'planned', 'issued', 'working', 'done'];
 
 export default function ProgressView() {
   const dispatch = useAppDispatch();
@@ -83,6 +83,7 @@ export default function ProgressView() {
     const working = orders.filter((item) => item.state === 'working').length;
     const issued = orders.filter((item) => item.state === 'issued').length;
     const planned = orders.filter((item) => item.state === 'planned').length;
+    const draft = orders.filter((item) => item.state === 'draft').length;
     const pendingFaults = faults.filter((item) => item.state === 'pending').length;
     const solvedFaults = faults.filter((item) => item.state === 'solved').length;
     return {
@@ -90,6 +91,7 @@ export default function ProgressView() {
       working,
       issued,
       planned,
+      draft,
       pendingFaults,
       solvedFaults,
       completion: orders.length === 0 ? 0 : Number(((done / orders.length) * 100).toFixed(1)),
@@ -97,16 +99,21 @@ export default function ProgressView() {
     };
   }, [orders, faults]);
 
-  const advance = async (id: string, next: WorkOrderState, code: string): Promise<void> => {
+  const advance = async (id: string, baseRevision: number, next: WorkOrderState, code: string): Promise<void> => {
     try {
-      const result = await dispatch(advanceWorkOrder({ id, next })).unwrap();
+      const result = await dispatch(advanceWorkOrder({ id, baseRevision, next })).unwrap();
       if (next === 'done') {
-        setToast(`${code} 已完成，回写销号 ${result.solvedCount} 处病害`);
+        setToast(`${code} 已完成，作业单状态与 ${result.solvedCount} 处病害销号已在同一次提交写入`);
       } else {
         setToast(`${code} 已推进为「${WORK_ORDER_STATE_LABEL[next]}」`);
       }
     } catch (error) {
-      setToast(`推进失败：${error instanceof Error ? error.message : '未知错误'}`);
+      const rejected = error as { message?: string; reason?: string };
+      if (rejected.reason === 'stale-work-order' || rejected.reason === 'stale-fault') {
+        setToast(`推进被拦住：${rejected.message ?? '数据已被其他标签页修改'}，已重新加载，请核对后再操作`);
+      } else {
+        setToast(`推进失败：${rejected.message ?? '未知错误'}`);
+      }
     }
   };
 
@@ -169,7 +176,7 @@ export default function ProgressView() {
             value={overview.working + overview.issued}
             suffix="张"
             color="#1565c0"
-            hint={`已下达 ${overview.issued} · 作业中 ${overview.working} · 待编排 ${overview.planned}`}
+            hint={`已下达 ${overview.issued} · 作业中 ${overview.working} · 待编排 ${overview.planned} · 草稿 ${overview.draft}`}
           />
         </Grid>
         <Grid item xs={12} sm={6} md={3}>
@@ -228,7 +235,15 @@ export default function ProgressView() {
           <Stack spacing={1.5}>
             {rows.map((order) => {
               const progressPercent =
-                order.state === 'done' ? 100 : order.state === 'working' ? 60 : order.state === 'issued' ? 30 : 10;
+                order.state === 'done'
+                  ? 100
+                  : order.state === 'working'
+                    ? 60
+                    : order.state === 'issued'
+                      ? 30
+                      : order.state === 'planned'
+                        ? 10
+                        : 0;
               const nextStates = WORK_ORDER_STATE_FLOW[order.state];
               const relatedFaults = faults.filter((item) => order.faultIds.includes(item.id));
               return (
@@ -241,7 +256,15 @@ export default function ProgressView() {
                         </Typography>
                         <Chip
                           size="small"
-                          color={order.state === 'done' ? 'success' : order.state === 'working' ? 'info' : 'default'}
+                          color={
+                            order.state === 'done'
+                              ? 'success'
+                              : order.state === 'draft'
+                                ? 'error'
+                                : order.state === 'working'
+                                  ? 'info'
+                                  : 'default'
+                          }
                           label={WORK_ORDER_STATE_LABEL[order.state]}
                         />
                         {order.conflict ? (
@@ -250,6 +273,7 @@ export default function ProgressView() {
                           </Tooltip>
                         ) : null}
                         <Chip size="small" variant="outlined" label={`负责人 ${order.leader}`} />
+                        <Chip size="small" variant="outlined" label={`修订号 r${order.revision}`} />
                       </Stack>
                       <Typography variant="caption" color="text.secondary" display="block" mt={0.5}>
                         天窗 {order.windowStart} ~ {order.windowEnd}（{formatDuration(order.durationMinutes)}）· 涉及站场{' '}
@@ -257,6 +281,11 @@ export default function ProgressView() {
                       </Typography>
                     </Box>
                     <Stack direction="row" spacing={1} flexWrap="wrap" useFlexGap>
+                      {order.state === 'draft' ? (
+                        <Tooltip title="存在时间窗 / 人员 / 机具冲突，已退回草稿；请到编排台处理冲突后重新保存">
+                          <Chip color="error" variant="outlined" label="待回编排台处理冲突" />
+                        </Tooltip>
+                      ) : null}
                       {nextStates.map((next) => (
                         <Button
                           key={next}
@@ -264,7 +293,7 @@ export default function ProgressView() {
                           variant={next === 'done' ? 'contained' : 'outlined'}
                           color={next === 'done' ? 'success' : 'primary'}
                           startIcon={next === 'done' ? <AssignmentTurnedInIcon /> : <PlayArrowIcon />}
-                          onClick={() => void advance(order.id, next, order.code)}
+                          onClick={() => void advance(order.id, order.revision, next, order.code)}
                         >
                           推进为{WORK_ORDER_STATE_LABEL[next]}
                         </Button>
@@ -351,8 +380,8 @@ export default function ProgressView() {
       </Box>
 
       <Alert severity="info" sx={{ mt: 2 }}>
-        说明：天窗作业单推进到「已完成」时，系统会把该单关联的全部待修病害一次性置为已销号并记录销号时间，
-        可在「病害评定与销号」页撤销销号。
+        说明：天窗作业单推进到「已完成」时，作业单状态与该单关联待修病害的销号在同一次提交里原子写入：
+        任一处写入失败都会整体回到提交前，重新打开页面也不会留下半成品。已手工销号的病害不会被重复回写。
       </Alert>
 
       <Snackbar

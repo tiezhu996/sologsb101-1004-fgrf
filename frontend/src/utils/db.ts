@@ -10,8 +10,10 @@ import type { Yard } from '../types/yard';
 import type { Switch } from '../types/switch';
 import type { Inspection } from '../types/inspection';
 import type { Fault } from '../types/fault';
-import type { WorkOrder } from '../types/workOrder';
-import { ROW_REVISION, type Revisioned } from '../types/persistence';
+import type { WorkOrder, WorkOrderConflictRef, WorkOrderState } from '../types/workOrder';
+import { INITIAL_REVISION, ROW_REVISION, type Revisioned } from '../types/persistence';
+import { findConflictRefs, type ConflictOrder } from './window';
+import { ConcurrencyError, nextRevision } from './concurrency';
 import { nowDateTime, shiftDate, todayDate, windowMinutes } from './window';
 import { nowIso, uuid } from './format';
 
@@ -19,10 +21,27 @@ import { nowIso, uuid } from './format';
 export const DB_NAME = 'gbrailswitch';
 
 /** 当前数据结构版本号（每次调整字段结构必须 +1 并补迁移） */
-export const DB_SCHEMA_VERSION = 2;
+export const DB_SCHEMA_VERSION = 3;
 
-export { ROW_REVISION };
+export { INITIAL_REVISION, ROW_REVISION };
 export type { Revisioned };
+
+/**
+ * 预提交日志（两阶段提交的回滚点）。
+ * 作业单完成 = 作业单状态 + 关联病害销号必须在同一次提交里写入；
+ * 写业务数据前先落「提交前完整快照」，业务数据落库成功后再删日志。
+ * 任意一步失败（含浏览器崩溃后重开），initDatabase 都按日志把作业单与病害
+ * 整体恢复到提交前，绝不留下"作业单已完成但销号没写"的半成品。
+ */
+export interface PendingCommitRow {
+  id: string;
+  kind: 'complete-work-order';
+  createdAt: string;
+  /** 提交前作业单完整快照 */
+  workOrderBefore: WorkOrder;
+  /** 提交前关联病害完整快照（仅提交时被回写销号的那部分） */
+  faultsBefore: Fault[];
+}
 
 /** 封锁 / 慢行条件登记（/backup 页） */
 export interface SpeedRestriction extends Revisioned {
@@ -55,6 +74,8 @@ class RailSwitchDatabase extends Dexie {
   workOrders!: Table<WorkOrderRow, string>;
   restrictions!: Table<SpeedRestrictionRow, string>;
   settings!: Table<{ id: string; value: string; updatedAt: string }, string>;
+  /** 预提交日志（作业单完成等多表原子提交的回滚点） */
+  pendingCommits!: Table<PendingCommitRow, string>;
 
   constructor() {
     super(DB_NAME);
@@ -70,7 +91,7 @@ class RailSwitchDatabase extends Dexie {
 
     // v2：新增 revision 行修订号；道岔补充轨型索引，病害补充组合索引便于按巡检批量操作，
     //     作业单补充负责人索引，并新增封锁条件表
-    this.version(DB_SCHEMA_VERSION)
+    this.version(2)
       .stores({
         yards: 'id, name, region, mileage',
         switches: 'id, yardId, code, frogNumber, railType, [yardId+code]',
@@ -113,10 +134,53 @@ class RailSwitchDatabase extends Dexie {
           if (!Array.isArray(row.machines)) row.machines = [];
         });
       });
+
+    // v3：乐观并发控制——作业单 / 病害的 revision 转为业务修订号（初值 1）；
+    //     作业单新增 remark（备注）与 conflictRefs（退回草稿时的冲突来源快照）；
+    //     state 新增 draft（草稿，有冲突待处理）；并新增 pendingCommits 预提交日志表。
+    this.version(DB_SCHEMA_VERSION)
+      .stores({
+        yards: 'id, name, region, mileage',
+        switches: 'id, yardId, code, frogNumber, railType, [yardId+code]',
+        inspections: 'id, switchId, date, inspector, [switchId+date]',
+        faults: 'id, inspectionId, part, severity, state, [inspectionId+part]',
+        workOrders: 'id, code, state, windowStart, leader',
+        restrictions: 'id, yardId, switchCode',
+        settings: 'id',
+        pendingCommits: 'id, kind',
+      })
+      .upgrade(async (tx) => {
+        await tx
+          .table<WorkOrderRow, string>('workOrders')
+          .toCollection()
+          .modify((row) => {
+            row.revision = INITIAL_REVISION;
+            if (typeof row.remark !== 'string') row.remark = '';
+            if (!Array.isArray(row.conflictRefs)) row.conflictRefs = [];
+          });
+        await tx
+          .table<FaultRow, string>('faults')
+          .toCollection()
+          .modify((row) => {
+            row.revision = INITIAL_REVISION;
+          });
+      });
   }
 }
 
 export const db = new RailSwitchDatabase();
+
+/** 作业单行 → 冲突计算所需的最小结构 */
+export function toConflictOrder(order: WorkOrderRow): ConflictOrder {
+  return {
+    id: order.id,
+    code: order.code,
+    windowStart: order.windowStart,
+    windowEnd: order.windowEnd,
+    members: order.members,
+    machines: order.machines,
+  };
+}
 
 /* ============================== 演示数据播种 ============================== */
 
@@ -259,7 +323,7 @@ async function seedDatabase(): Promise<void> {
             state: solved ? 'solved' : 'pending',
             solvedAt: solved ? `${shiftDate(offsetDays + 2)} 15:30` : null,
             createdAt: stamp,
-            revision: ROW_REVISION,
+            revision: INITIAL_REVISION,
           });
         }
       }
@@ -267,48 +331,83 @@ async function seedDatabase(): Promise<void> {
   });
 
   // 天窗作业单：为部分待修病害编排（同一时间窗刻意留一张不冲突、一张与人员冲突）
-  const pendingFaults = faults.filter((item) => item.state === 'pending');
+  // 第 2 张与第 1 张时间窗重叠且人员孙立波重复排班 → 按规则保留为「草稿（有冲突）」
+  // 三个分组的病害必须互斥（一处病害只能属于一张作业单），因此从待修池里顺序取
+  const pendingPool = faults.filter((item) => item.state === 'pending');
+  const groupFaults: FaultRow[][] = [[], [], []];
+  for (const fault of pendingPool) {
+    if (groupFaults[0].length < 3 && fault.severity !== 'light') groupFaults[0].push(fault);
+    else if (groupFaults[1].length < 2 && fault.severity === 'light') groupFaults[1].push(fault);
+    else if (groupFaults[2].length < 2) groupFaults[2].push(fault);
+  }
   const today = todayDate();
-  const groups: Array<{ faults: FaultRow[]; start: string; end: string; leader: string; state: WorkOrderRow['state'] }> = [
+  const groups: Array<{
+    faults: FaultRow[];
+    start: string;
+    end: string;
+    leader: string;
+    state: WorkOrderRow['state'];
+    members: string[];
+    machines: string[];
+    remark: string;
+  }> = [
     {
-      faults: pendingFaults.filter((item) => item.severity !== 'light').slice(0, 3),
+      faults: groupFaults[0],
       start: `${shiftDate(0)} 09:00`,
       end: `${shiftDate(0)} 11:30`,
       leader: '赵铁军',
       state: 'issued',
+      members: ['赵铁军', '孙立波'],
+      machines: ['轨距尺', '钢轨打磨机', '扭矩扳手'],
+      remark: '已下达，班前会已交底',
     },
     {
-      faults: pendingFaults.filter((item) => item.severity === 'light').slice(0, 2),
+      faults: groupFaults[1],
       start: `${shiftDate(0)} 10:00`,
       end: `${shiftDate(0)} 12:00`,
       leader: '孙立波',
-      state: 'planned',
+      state: 'draft',
+      members: ['孙立波', '郑小勇'],
+      machines: ['道尺', '捣固镐'],
+      remark: '与 01 单人员时间窗冲突，待改期后重新保存',
     },
     {
-      faults: pendingFaults.slice(3, 5),
+      faults: groupFaults[2],
       start: `${shiftDate(1)} 13:00`,
       end: `${shiftDate(1)} 15:00`,
       leader: '周振海',
       state: 'planned',
+      members: ['周振海', '冯国栋'],
+      machines: ['道尺', '捣固镐'],
+      remark: '',
     },
   ];
 
   groups.forEach((group, index) => {
     if (group.faults.length === 0) return;
-    workOrders.push({
-      id: `wo-${index + 1}`,
+    const orderId = `wo-${index + 1}`;
+    const order: WorkOrderRow = {
+      id: orderId,
       code: `TW-${today.replace(/-/g, '')}-${String(index + 1).padStart(2, '0')}`,
       faultIds: group.faults.map((item) => item.id),
       windowStart: group.start,
       windowEnd: group.end,
       leader: group.leader,
-      machines: index === 0 ? ['轨距尺', '钢轨打磨机', '扭矩扳手'] : ['道尺', '捣固镐'],
-      members: index === 0 ? ['赵铁军', '孙立波'] : index === 1 ? ['孙立波', '郑小勇'] : ['周振海', '冯国栋'],
+      machines: group.machines,
+      members: group.members,
+      remark: group.remark,
       state: group.state,
+      conflictRefs: [],
       createdAt: stamp,
       updatedAt: stamp,
-      revision: ROW_REVISION,
-    });
+      revision: INITIAL_REVISION,
+    };
+    // 与已构造的作业单做一次结构化冲突计算，作为草稿冲突来源快照
+    order.conflictRefs = findConflictRefs(
+      toConflictOrder(order),
+      workOrders.map((item) => toConflictOrder(item)),
+    );
+    workOrders.push(order);
   });
 
   restrictions.push(
@@ -350,13 +449,32 @@ async function seedDatabase(): Promise<void> {
 
 /* ============================== 初始化 ============================== */
 
-/** 打开数据库；站场表为空时播种演示数据（幂等） */
+/** 打开数据库；先恢复未完成的预提交，再在站场表为空时播种演示数据（幂等） */
 export async function initDatabase(): Promise<void> {
   await db.open();
+  await recoverPendingCommits();
   const count = await db.yards.count();
   if (count === 0) {
     await seedDatabase();
   }
+}
+
+/**
+ * 恢复未完成的预提交：只要 pendingCommits 里留有日志，说明上次会话在
+ * "写作业单状态 + 回写病害销号"的原子提交中途退出（崩溃 / 断电 / 写入失败）。
+ * 一律按日志中的提交前快照整体还原，再删除日志，恢复到提交前的完整状态。
+ */
+export async function recoverPendingCommits(): Promise<{ recovered: number }> {
+  const pending = await db.pendingCommits.toArray();
+  if (pending.length === 0) return { recovered: 0 };
+  await db.transaction('rw', [db.workOrders, db.faults, db.pendingCommits], async () => {
+    for (const entry of pending) {
+      await db.workOrders.put(entry.workOrderBefore);
+      if (entry.faultsBefore.length > 0) await db.faults.bulkPut(entry.faultsBefore);
+    }
+    await db.pendingCommits.clear();
+  });
+  return { recovered: pending.length };
 }
 
 /* ============================== 站场 ============================== */
@@ -392,7 +510,7 @@ export async function removeYard(id: string): Promise<void> {
           const remaining = order.faultIds.filter((faultId) => !faultIds.has(faultId));
           if (remaining.length !== order.faultIds.length) {
             if (remaining.length === 0) await db.workOrders.delete(order.id);
-            else await db.workOrders.put({ ...order, faultIds: remaining, updatedAt: nowIso() });
+            else await db.workOrders.put({ ...order, faultIds: remaining, updatedAt: nowIso(), revision: nextRevision(order.revision) });
           }
         }
       }
@@ -432,7 +550,7 @@ export async function removeSwitch(id: string): Promise<void> {
         const remaining = order.faultIds.filter((faultId) => !faultIds.has(faultId));
         if (remaining.length !== order.faultIds.length) {
           if (remaining.length === 0) await db.workOrders.delete(order.id);
-          else await db.workOrders.put({ ...order, faultIds: remaining, updatedAt: nowIso() });
+          else await db.workOrders.put({ ...order, faultIds: remaining, updatedAt: nowIso(), revision: nextRevision(order.revision) });
         }
       }
       await db.faults.where('inspectionId').anyOf(inspectionIds).delete();
@@ -463,7 +581,7 @@ export async function removeInspection(id: string): Promise<void> {
       const remaining = order.faultIds.filter((faultId) => !faultIds.has(faultId));
       if (remaining.length !== order.faultIds.length) {
         if (remaining.length === 0) await db.workOrders.delete(order.id);
-        else await db.workOrders.put({ ...order, faultIds: remaining, updatedAt: nowIso() });
+        else await db.workOrders.put({ ...order, faultIds: remaining, updatedAt: nowIso(), revision: nextRevision(order.revision) });
       }
     }
     await db.faults.where('inspectionId').equals(id).delete();
@@ -492,7 +610,7 @@ export async function removeFault(id: string): Promise<void> {
       if (!order.faultIds.includes(id)) continue;
       const remaining = order.faultIds.filter((faultId) => faultId !== id);
       if (remaining.length === 0) await db.workOrders.delete(order.id);
-      else await db.workOrders.put({ ...order, faultIds: remaining, updatedAt: nowIso() });
+      else await db.workOrders.put({ ...order, faultIds: remaining, updatedAt: nowIso(), revision: nextRevision(order.revision) });
     }
     await db.faults.delete(id);
   });
@@ -505,12 +623,377 @@ export async function listWorkOrders(): Promise<WorkOrderRow[]> {
   return rows.sort((a, b) => a.windowStart.localeCompare(b.windowStart));
 }
 
+/** 无并发保护的整行写入（仅供批量导入 / 恢复等内部场景） */
 export async function putWorkOrder(row: WorkOrderRow): Promise<void> {
   await db.workOrders.put(row);
 }
 
-export async function removeWorkOrder(id: string): Promise<void> {
-  await db.workOrders.delete(id);
+/** 参与冲突计算的作业单字段 */
+export type WorkOrderDraftInput = Pick<
+  WorkOrderRow,
+  'code' | 'faultIds' | 'windowStart' | 'windowEnd' | 'leader' | 'machines' | 'members' | 'remark'
+>;
+
+/** 已被别的作业单占用的病害 */
+export interface OccupiedFault {
+  faultId: string;
+  orderId: string;
+  orderCode: string;
+}
+
+/** 保存作业单的结果：级联退回草稿清单 + 本单冲突明细 */
+export interface SaveWorkOrderResult {
+  /** 保存后的作业单 */
+  order: WorkOrderRow;
+  /** 是否新建 */
+  created: boolean;
+  /** 本单当前的全部冲突来源 */
+  selfConflictRefs: WorkOrderConflictRef[];
+  /** 因本单保存而被退回草稿的其他未下达作业单 */
+  cascaded: Array<{ id: string; code: string; conflictRefs: WorkOrderConflictRef[] }>;
+}
+
+/** 未下达（会因冲突被退回草稿）的状态 */
+const FLEXIBLE_STATES: ReadonlySet<WorkOrderState> = new Set(['draft', 'planned']);
+
+function checkFaultOccupation(
+  faultIds: string[],
+  allOrders: WorkOrderRow[],
+  excludeOrderId: string,
+): { occupied: OccupiedFault[]; missing: string[] } {
+  const occupied: OccupiedFault[] = [];
+  const seen = new Set<string>();
+  for (const order of allOrders) {
+    if (order.id === excludeOrderId) continue;
+    for (const faultId of order.faultIds) {
+      if (faultIds.includes(faultId) && !seen.has(faultId)) {
+        seen.add(faultId);
+        occupied.push({ faultId, orderId: order.id, orderCode: order.code });
+      }
+    }
+  }
+  return { occupied, missing: [] };
+}
+
+/**
+ * 按修订号提交作业单（新建 / 编辑保存），一个 IndexedDB 事务内完成：
+ * 1. 编辑保存按基版号做 CAS：已被其他标签页改过则拦住，不允许覆盖；
+ * 2. 关联病害已被别的作业单占用 → 硬拦截，当前页面提交不生效；
+ * 3. 时间窗 / 人员 / 机具一有冲突：本单落为草稿，受影响的其他未下达作业单
+ *    一并退回草稿并写入结构化冲突来源；冲突解除后再保存自动回到待编排。
+ * 已下达及以后的作业单不被退回。
+ */
+export async function saveWorkOrder(input: {
+  id?: string;
+  baseRevision?: number;
+  draft: WorkOrderDraftInput;
+  now?: string;
+}): Promise<SaveWorkOrderResult> {
+  const { id, baseRevision, draft, now = nowDateTime() } = input;
+  const result = await db.transaction('rw', [db.workOrders, db.faults], async () => {
+    const allOrdersRaw = await db.workOrders.toArray();
+    // 旧版导入快照可能缺 remark / conflictRefs，统一兜底后再参与计算
+    const allOrders = allOrdersRaw.map((row) => ({
+      ...row,
+      remark: typeof row.remark === 'string' ? row.remark : '',
+      conflictRefs: Array.isArray(row.conflictRefs) ? row.conflictRefs : [],
+      machines: Array.isArray(row.machines) ? row.machines : [],
+      members: Array.isArray(row.members) ? row.members : [],
+      faultIds: Array.isArray(row.faultIds) ? row.faultIds : [],
+    }));
+    const existing = id ? allOrders.find((item) => item.id === id) : undefined;
+    if (id && !existing) {
+      throw new ConcurrencyError('not-found', '作业单不存在或已被其他页面删除', { orderId: id });
+    }
+    if (existing && typeof baseRevision === 'number' && existing.revision !== baseRevision) {
+      throw new ConcurrencyError('stale-work-order', '该作业单已被其他标签页修改，请读取最新版本后重新编辑', {
+        orderId: existing.id,
+        orderCode: existing.code,
+        baseRevision,
+        latestRevision: existing.revision,
+      });
+    }
+
+    // 病害占用硬拦截（已完成 / 已销号也仍归属作业单，一处病害只能编排进一张作业单）
+    const { occupied } = checkFaultOccupation(draft.faultIds, allOrders, existing?.id ?? '__new__');
+    if (occupied.length > 0) {
+      throw new ConcurrencyError('fault-occupied', '关联病害已被其他作业单占用，请先解除占用', {
+        occupied,
+      });
+    }
+
+    const savedId = existing?.id ?? `wo-${uuid()}`;
+    const saved: WorkOrderRow = {
+      id: savedId,
+      code: draft.code.trim(),
+      faultIds: draft.faultIds,
+      windowStart: draft.windowStart,
+      windowEnd: draft.windowEnd,
+      leader: draft.leader.trim(),
+      machines: draft.machines,
+      members: draft.members,
+      remark: draft.remark,
+      state: existing?.state ?? 'planned',
+      conflictRefs: existing?.conflictRefs ?? [],
+      createdAt: existing?.createdAt ?? now,
+      updatedAt: now,
+      revision: nextRevision(existing?.revision),
+    };
+
+    // 本单与其他作业单的结构化冲突来源
+    const others = allOrders.filter((item) => item.id !== savedId).map((item) => toConflictOrder(item));
+    const selfConflictRefs = findConflictRefs(toConflictOrder(saved), others);
+    saved.conflictRefs = selfConflictRefs;
+    if (selfConflictRefs.length > 0) {
+      // 有冲突：新建与未下达单落为草稿；已下达及以后的单保持状态（冲突只提示）
+      if (!existing || FLEXIBLE_STATES.has(existing.state)) {
+        saved.state = 'draft';
+      }
+    } else if (existing?.state === 'draft') {
+      // 冲突解除：草稿重新保存后自动回到待编排
+      saved.state = 'planned';
+    }
+
+    // 级联：受本单影响的其他未下达作业单
+    const cascaded: SaveWorkOrderResult['cascaded'] = [];
+    const otherOrders = await Promise.all(
+      allOrders
+        .filter((item) => item.id !== savedId && FLEXIBLE_STATES.has(item.state))
+        .map(async (other) => {
+          // 其他单与"本单 + 除本单外的单子"重新计算冲突
+          const peers = allOrders
+            .filter((item) => item.id !== other.id && item.id !== savedId)
+            .map((item) => toConflictOrder(item));
+          const refs = findConflictRefs(toConflictOrder(other), [toConflictOrder(saved), ...peers]);
+          return { other, refs };
+        }),
+    );
+    for (const { other, refs } of otherOrders) {
+      if (other.state === 'draft') {
+        // 已是草稿：刷新冲突来源快照；冲突全部解除则自动回到待编排
+        const next: WorkOrderRow = {
+          ...other,
+          conflictRefs: refs,
+          state: refs.length === 0 ? 'planned' : 'draft',
+          updatedAt: now,
+          revision: refs.length === other.conflictRefs.length && sameRefs(refs, other.conflictRefs)
+            ? other.revision
+            : nextRevision(other.revision),
+        };
+        if (next.revision !== other.revision || next.state !== other.state) {
+          await db.workOrders.put(next);
+          cascaded.push({ id: next.id, code: next.code, conflictRefs: refs });
+        }
+      } else if (refs.length > 0) {
+        // 待编排单新产生冲突 → 退回草稿
+        const next: WorkOrderRow = {
+          ...other,
+          state: 'draft',
+          conflictRefs: refs,
+          updatedAt: now,
+          revision: nextRevision(other.revision),
+        };
+        await db.workOrders.put(next);
+        cascaded.push({ id: next.id, code: next.code, conflictRefs: refs });
+      }
+    }
+
+    await db.workOrders.put(saved);
+    return { order: saved, created: !existing, selfConflictRefs, cascaded };
+  });
+  return result;
+}
+
+function sameRefs(a: WorkOrderConflictRef[], b: WorkOrderConflictRef[]): boolean {
+  if (a.length !== b.length) return false;
+  const key = (ref: WorkOrderConflictRef): string => `${ref.orderId}|${ref.kind}|${ref.resource}`;
+  const setB = new Set(b.map(key));
+  return a.every((ref) => setB.has(key(ref)));
+}
+
+export async function removeWorkOrder(id: string, expectedRevision?: number): Promise<void> {
+  await db.transaction('rw', [db.workOrders], async () => {
+    if (typeof expectedRevision === 'number') {
+      const existing = await db.workOrders.get(id);
+      if (existing && existing.revision !== expectedRevision) {
+        throw new ConcurrencyError('stale-work-order', '该作业单已被其他标签页修改或删除，请刷新后重试', {
+          orderId: id,
+          baseRevision: expectedRevision,
+          latestRevision: existing.revision,
+        });
+      }
+    }
+    await db.workOrders.delete(id);
+  });
+}
+
+/**
+ * 病害销号 / 撤销的 CAS 写入：携带读取时修订号，被其他标签页改过则拦住。
+ * 供病害页手工销号使用（作业单完成回写走 completeWorkOrder 的原子事务）。
+ */
+export async function setFaultStateCAS(input: {
+  faultId: string;
+  baseRevision: number;
+  state: FaultRow['state'];
+  solvedAt: string | null;
+}): Promise<void> {
+  await db.transaction('rw', [db.faults], async () => {
+    const existing = await db.faults.get(input.faultId);
+    if (!existing) {
+      throw new ConcurrencyError('not-found', '病害不存在或已被删除', { faultId: input.faultId });
+    }
+    if (existing.revision !== input.baseRevision) {
+      throw new ConcurrencyError('stale-fault', '该病害已被其他标签页修改，请刷新后重试', {
+        faultId: input.faultId,
+        baseRevision: input.baseRevision,
+        latestRevision: existing.revision,
+      });
+    }
+    await db.faults.put({
+      ...existing,
+      state: input.state,
+      solvedAt: input.solvedAt,
+      revision: nextRevision(existing.revision),
+    });
+  });
+}
+
+/**
+ * 作业单完成的原子提交（作业单状态 + 关联病害销号在同一次提交里写入）。
+ * 两阶段：先落预提交日志（提交前完整快照）→ 再在一个业务事务里写作业单与病害 →
+ * 成功后删除日志。任一步失败：
+ * - 业务事务失败：IndexedDB 自动回滚，日志仍在，重开时恢复到提交前；
+ * - 删日志前崩溃：重开时 initDatabase 按日志把作业单与病害整体恢复到提交前。
+ * @param expectedFaultRevisions 仅对修订号匹配的待修病害回写销号；
+ *        任一病害已被其他页面改动（如手工销号 / 撤销）则拦住整次提交。
+ */
+export async function completeWorkOrder(input: {
+  id: string;
+  baseRevision: number;
+  solvedAt?: string;
+}): Promise<{ order: WorkOrderRow; solvedCount: number }> {
+  const { id, baseRevision, solvedAt = nowDateTime() } = input;
+
+  // 阶段一：在独立事务里抓取提交前完整快照并落预提交日志
+  const commitId = `commit-${uuid()}`;
+  const before = await db.transaction<{ order: WorkOrderRow; faultsBefore: FaultRow[] }>(
+    'r',
+    [db.workOrders, db.faults],
+    async () => {
+      const order = await db.workOrders.get(id);
+      if (!order) {
+        throw new ConcurrencyError('not-found', '作业单不存在或已被其他页面删除', { orderId: id });
+      }
+      if (order.revision !== baseRevision) {
+        throw new ConcurrencyError('stale-work-order', '该作业单已被其他标签页修改，请刷新后再完成', {
+          orderId: order.id,
+          orderCode: order.code,
+          baseRevision,
+          latestRevision: order.revision,
+        });
+      }
+      if (order.state !== 'working') {
+        throw new ConcurrencyError('not-found', `当前状态不允许完成：${order.state}`, { orderId: id });
+      }
+      const related = await db.faults.where('id').anyOf(order.faultIds).toArray();
+      const pending = related.filter((item) => item.state === 'pending');
+      return { order, faultsBefore: pending };
+    },
+  );
+
+  const journal: PendingCommitRow = {
+    id: commitId,
+    kind: 'complete-work-order',
+    createdAt: nowIso(),
+    workOrderBefore: before.order,
+    faultsBefore: before.faultsBefore,
+  };
+  await db.pendingCommits.put(journal);
+
+  // 阶段二：业务事务——作业单置完成 + 待修病害置已销号（CAS 比对修订号）
+  try {
+    const result = await db.transaction('rw', [db.workOrders, db.faults], async () => {
+      const order = await db.workOrders.get(id);
+      if (!order) {
+        throw new ConcurrencyError('not-found', '作业单不存在或已被其他页面删除', { orderId: id });
+      }
+      if (order.revision !== baseRevision) {
+        throw new ConcurrencyError('stale-work-order', '该作业单已被其他标签页修改，请刷新后再完成', {
+          orderId: order.id,
+          orderCode: order.code,
+          baseRevision,
+          latestRevision: order.revision,
+        });
+      }
+      const related = await db.faults.where('id').anyOf(order.faultIds).toArray();
+      const staleFaults = related.filter(
+        (item) =>
+          item.state === 'pending' &&
+          !before.faultsBefore.some((snapshot) => snapshot.id === item.id && snapshot.revision === item.revision),
+      );
+      if (staleFaults.length > 0) {
+        throw new ConcurrencyError('stale-fault', '关联病害已被其他页面改动，请刷新后再完成', {
+          orderId: order.id,
+          orderCode: order.code,
+          faultIds: staleFaults.map((item) => item.id),
+        });
+      }
+      const pending = related.filter((item) => item.state === 'pending');
+      for (const fault of pending) {
+        await db.faults.put({ ...fault, state: 'solved' as const, solvedAt, revision: nextRevision(fault.revision) });
+      }
+      const completed: WorkOrderRow = {
+        ...order,
+        state: 'done',
+        updatedAt: solvedAt,
+        revision: nextRevision(order.revision),
+      };
+      await db.workOrders.put(completed);
+      return { order: completed, solvedCount: pending.length };
+    });
+
+    // 阶段三：业务数据已全部落库，删除预提交日志（提交完成）
+    await db.pendingCommits.delete(commitId);
+    return result;
+  } catch (error) {
+    // 业务事务失败时 IndexedDB 已回滚；日志保留，重开恢复。此处直接把失败抛给调用方。
+    throw error;
+  }
+}
+
+/**
+ * 普通状态推进（已下达 / 作业中）：按修订号 CAS，单表写入。
+ * 不做跨表回写，不需要预提交日志。
+ */
+export async function advanceWorkOrderState(input: {
+  id: string;
+  baseRevision: number;
+  next: WorkOrderState;
+  now?: string;
+}): Promise<WorkOrderRow> {
+  const { id, baseRevision, next, now = nowDateTime() } = input;
+  return db.transaction('rw', [db.workOrders], async () => {
+    const existing = await db.workOrders.get(id);
+    if (!existing) {
+      throw new ConcurrencyError('not-found', '作业单不存在或已被其他页面删除', { orderId: id });
+    }
+    if (existing.revision !== baseRevision) {
+      throw new ConcurrencyError('stale-work-order', '该作业单已被其他标签页修改，请刷新后再推进', {
+        orderId: existing.id,
+        orderCode: existing.code,
+        baseRevision,
+        latestRevision: existing.revision,
+      });
+    }
+    const updated: WorkOrderRow = {
+      ...existing,
+      state: next,
+      updatedAt: now,
+      revision: nextRevision(existing.revision),
+    };
+    await db.workOrders.put(updated);
+    return updated;
+  });
 }
 
 /* =========================== 封锁 / 慢行条件 =========================== */
@@ -567,7 +1050,7 @@ export async function exportSnapshot(): Promise<DatabaseSnapshot> {
 export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> {
   await db.transaction(
     'rw',
-    [db.yards, db.switches, db.inspections, db.faults, db.workOrders, db.restrictions],
+    [db.yards, db.switches, db.inspections, db.faults, db.workOrders, db.restrictions, db.pendingCommits],
     async () => {
       await Promise.all([
         db.yards.clear(),
@@ -576,6 +1059,7 @@ export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> 
         db.faults.clear(),
         db.workOrders.clear(),
         db.restrictions.clear(),
+        db.pendingCommits.clear(),
       ]);
       await db.yards.bulkPut(snapshot.yards ?? []);
       await db.switches.bulkPut(snapshot.switches ?? []);
@@ -591,7 +1075,7 @@ export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> 
 export async function resetDatabase(): Promise<void> {
   await db.transaction(
     'rw',
-    [db.yards, db.switches, db.inspections, db.faults, db.workOrders, db.restrictions],
+    [db.yards, db.switches, db.inspections, db.faults, db.workOrders, db.restrictions, db.pendingCommits],
     async () => {
       await Promise.all([
         db.yards.clear(),
@@ -600,6 +1084,7 @@ export async function resetDatabase(): Promise<void> {
         db.faults.clear(),
         db.workOrders.clear(),
         db.restrictions.clear(),
+        db.pendingCommits.clear(),
       ]);
     },
   );
@@ -608,15 +1093,16 @@ export async function resetDatabase(): Promise<void> {
 
 /** 各表行数统计 */
 export async function countAll(): Promise<Record<string, number>> {
-  const [yards, switches, inspections, faults, workOrders, restrictions] = await Promise.all([
+  const [yards, switches, inspections, faults, workOrders, restrictions, pendingCommits] = await Promise.all([
     db.yards.count(),
     db.switches.count(),
     db.inspections.count(),
     db.faults.count(),
     db.workOrders.count(),
     db.restrictions.count(),
+    db.pendingCommits.count(),
   ]);
-  return { yards, switches, inspections, faults, workOrders, restrictions };
+  return { yards, switches, inspections, faults, workOrders, restrictions, pendingCommits };
 }
 
 /** 结构版本信息 */
