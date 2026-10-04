@@ -137,6 +137,7 @@ export const updateInspection = createAsyncThunk<
       inspector: draft.inspector.trim(),
       weather: draft.weather,
       method: draft.method,
+      revision: existing.revision + 1,
     });
     emitChange();
   } catch (error) {
@@ -195,6 +196,7 @@ export const updateFault = createAsyncThunk<
       type: draft.type,
       severity: draft.severity,
       sizeMm: draft.sizeMm,
+      revision: existing.revision + 1,
     });
     emitChange();
   } catch (error) {
@@ -212,7 +214,7 @@ export const bulkSetSeverity = createAsyncThunk<
     const state = (getState() as { fault: FaultStateSlice }).fault;
     const rows = state.faults.filter((item) => faultIds.includes(item.id));
     if (rows.length === 0) return 0;
-    await putFaults(rows.map((item) => ({ ...item, severity })));
+    await putFaults(rows.map((item) => ({ ...item, severity, revision: item.revision + 1 })));
     emitChange();
     return rows.length;
   } catch (error) {
@@ -228,7 +230,7 @@ export const bulkEscalate = createAsyncThunk<number, string[], { rejectValue: st
       const state = (getState() as { fault: FaultStateSlice }).fault;
       const rows = state.faults.filter((item) => faultIds.includes(item.id));
       if (rows.length === 0) return 0;
-      await putFaults(rows.map((item) => ({ ...item, severity: escalate(item.severity) })));
+      await putFaults(rows.map((item) => ({ ...item, severity: escalate(item.severity), revision: item.revision + 1 })));
       emitChange();
       return rows.length;
     } catch (error) {
@@ -237,22 +239,33 @@ export const bulkEscalate = createAsyncThunk<number, string[], { rejectValue: st
   },
 );
 
-/** 手工销号 / 撤销销号 */
+/** 手工销号 / 撤销销号（修订号随销号状态推进）。
+ *  病害已被未完成作业单占用时，不允许在此手工销号，统一由作业单完成回写，避免并发覆盖。 */
 export const setFaultState = createAsyncThunk<
-  void,
+  { blockedBy?: string },
   { faultId: string; state: FaultState },
   { rejectValue: string }
 >('fault/setState', async ({ faultId, state }, { getState, rejectWithValue }) => {
   try {
     const slice = (getState() as { fault: FaultStateSlice }).fault;
     const existing = slice.faults.find((item) => item.id === faultId);
-    if (!existing) return;
+    if (!existing) return {};
+    if (state === 'solved') {
+      const occupant = slice.workOrders.find(
+        (order) => order.state !== 'done' && order.faultIds.includes(faultId),
+      );
+      if (occupant) {
+        return { blockedBy: occupant.code };
+      }
+    }
     await putFault({
       ...existing,
       state,
       solvedAt: state === 'solved' ? nowIso() : null,
+      revision: existing.revision + 1,
     });
     emitChange();
+    return {};
   } catch (error) {
     return rejectWithValue(error instanceof Error ? error.message : '更新销号状态失败');
   }

@@ -93,7 +93,7 @@ sologsb101-1004/
 ## 六、数据存储说明
 
 - **存储介质**：浏览器 IndexedDB，库名 **`gbrailswitch`**，通过 Dexie 4.x 封装。
-- **数据结构版本**：`utils/db.ts` 中 `DB_SCHEMA_VERSION = 2`，并登记 v1 → v2 的 `upgrade` 迁移（补齐行修订号、迁移 `faultType → type` / `faultPart → part`、`faultIds` 字符串拆分为数组、新增 `restrictions` 与 `settings` 表）。
+- **数据结构版本**：`utils/db.ts` 中 `DB_SCHEMA_VERSION = 3`，并登记 v1 → v2 → v3 的 `upgrade` 迁移（v2 补齐行修订号、迁移 `faultType → type` / `faultPart → part`、`faultIds` 字符串拆分为数组、新增 `restrictions` 与 `settings` 表；v3 作业单补充 `remark` / `draftKickback` 字段并新增 `pendingCommits` 原子提交日志表）。
 - **数据表**：
 
   | 表名 | 实体 | 主要索引 |
@@ -105,6 +105,14 @@ sologsb101-1004/
   | `workOrders` | 天窗作业单 | id / code / state / windowStart / leader |
   | `restrictions` | 封锁 / 慢行条件 | id / yardId / switchCode |
   | `settings` | 自定义字典 | id |
+  | `pendingCommits` | 原子提交 WAL（作业单完成的提交前镜像） | id / kind / createdAt |
+
+- **多标签并发（班组常开多个编排页）**：
+  - **按修订号提交（乐观锁）**：编辑对话框记住打开时的行修订号，保存 / 推进均带期望修订号；别的标签先改过则本次提交被 `RevisionConflictError` 拒绝，页面随即读取最新版本做三方合并——未冲突的备注按行自动合并、双方新增的人员 / 机具取并集，双方改法不同的字段两边内容都保留，在冲突面板里人工二选一后才能再次保存。
+  - **病害占用拦截**：同一待修病害只能编进一张未完成作业单；已被别的作业单占用时当前页面提交被 `FaultOccupiedError` 拦住。
+  - **受影响作业单退回草稿**：任一时间窗、人员或机具变化与其它「待编排」作业单产生新冲突时，受影响作业单在同一事务内退回草稿（`draftKickback`）并逐条列出冲突来源（编号 + 时间窗/人员/机具 + 明细）；带未处理退回冲突的作业单不能下达；冲突解除后标记自动清除。
+  - **跨标签实时同步**：`BroadcastChannel`（localStorage storage 事件兜底）+ `visibilitychange` / `focus` 主动重读，重新打开或切回页面即拿到其它页面写入的最新版本。
+  - **完成原子提交**：作业单推进到「已完成」时，作业单状态与涉及病害销号在同一个 IndexedDB 事务里写入，并先落一条 `pendingCommits` WAL（提交前完整快照）；任一步失败立即按快照恢复，浏览器崩溃导致日志残留时，下次 `initDatabase()` 自动回滚到提交前的完整状态，不留下「状态完成但病害没销号」的半成品。
 
 - **首屏自动播种**：`initDatabase()` 在 `yards` 表为空时写入演示数据（幂等）——2 个站场 × 各 4 组道岔 × 1~2 次巡检 × 每次 0~3 条病害 + 3 张天窗作业单（含 1 张刻意与人员时间窗冲突）+ 2 条封锁条件，父子记录通过 `yardId / switchId / inspectionId / faultIds` 互相引用。
 - **跨页状态**：全部放在 Redux Toolkit store（`yardStore / switchStore / faultStore / workOrderStore`），页面只读 store；Dexie 写入后由 `utils/events.ts` 广播，store 自动重新拉取。

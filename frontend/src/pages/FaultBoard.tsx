@@ -310,10 +310,22 @@ export default function FaultBoard() {
             startIcon={<DoneAllIcon />}
             disabled={selected.length === 0}
             onClick={async () => {
+              const blocked: string[] = [];
+              let done = 0;
               for (const faultId of selected) {
-                await dispatch(setFaultState({ faultId, state: 'solved' }));
+                const result = await dispatch(setFaultState({ faultId, state: 'solved' }));
+                const payload = 'payload' in result ? result.payload : undefined;
+                if (payload && typeof payload === 'object' && 'blockedBy' in payload && payload.blockedBy) {
+                  blocked.push(payload.blockedBy);
+                } else {
+                  done += 1;
+                }
               }
-              setToast(`已手工销号 ${selected.length} 处病害`);
+              setToast(
+                blocked.length > 0
+                  ? `已手工销号 ${done} 处；被 ${[...new Set(blocked)].join('、')} 等作业单占用的病害需随作业单完成销号，已跳过`
+                  : `已手工销号 ${selected.length} 处病害`,
+              );
               setSelected([]);
             }}
           >
@@ -451,10 +463,18 @@ export default function FaultBoard() {
                         size="small"
                         color={row.state === 'solved' ? 'warning' : 'success'}
                         onClick={async () => {
-                          await dispatch(
-                            setFaultState({ faultId: row.id, state: row.state === 'solved' ? 'pending' : 'solved' }),
-                          );
-                          setToast(row.state === 'solved' ? '已撤销销号' : '已手工销号');
+                          if (row.state !== 'solved') {
+                            const result = await dispatch(setFaultState({ faultId: row.id, state: 'solved' }));
+                            const payload = 'payload' in result ? result.payload : undefined;
+                            if (payload && typeof payload === 'object' && 'blockedBy' in payload && payload.blockedBy) {
+                              setToast(`该病害已被作业单 ${payload.blockedBy} 占用，需随作业单完成一起销号`);
+                              return;
+                            }
+                            setToast('已手工销号');
+                          } else {
+                            await dispatch(setFaultState({ faultId: row.id, state: 'pending' }));
+                            setToast('已撤销销号');
+                          }
                         }}
                       >
                         {row.state === 'solved' ? '撤销' : '销号'}

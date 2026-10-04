@@ -31,6 +31,7 @@ import ArchiveIcon from '@mui/icons-material/Archive';
 // 若从 ./router（会 import App）引入会形成循环依赖 → TDZ「Cannot access before initialization」
 import { ROUTES } from './router/routes';
 import { initDatabase } from './utils/db';
+import { initCrossTabBridge } from './utils/events';
 import { refreshAll, subscribeStoreRefresh } from './stores';
 import { useAppSelector } from './hooks/useAppStore';
 import { selectFaultCounts } from './stores/faultStore';
@@ -59,6 +60,8 @@ export default function App() {
 
   useEffect(() => {
     let cancelled = false;
+    // 先建跨标签桥：其它标签写入 / 本标签重新可见时都从 IndexedDB 重读最新版本
+    initCrossTabBridge();
     void (async () => {
       await initDatabase();
       if (cancelled) return;

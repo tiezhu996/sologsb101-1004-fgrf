@@ -1,38 +1,36 @@
 /**
  * 天窗作业单状态（Redux Toolkit slice）
  * 维护作业单编排、时间窗冲突校验、人员机具占用校验与进度推进（完成回写销号）。
+ *
+ * 多标签并发：
+ * - 保存 / 推进均带行修订号（乐观锁），过期提交被 RevisionConflictError 拦住；
+ * - 保存走 saveWorkOrderAtomically：病害被占用即拒，受影响的未下达单退回草稿并记录冲突来源；
+ * - 完成走 advanceWorkOrderAtomically：作业单状态与病害销号同一原子提交，失败按 WAL 恢复。
  */
 import { createAsyncThunk, createSlice, type PayloadAction } from '@reduxjs/toolkit';
 import {
-  ROW_REVISION,
+  advanceWorkOrderAtomically,
   listFaults,
   listInspections,
   listSwitches,
   listWorkOrders,
   listYards,
-  putFaults,
-  putWorkOrder,
   removeWorkOrder,
+  saveWorkOrderAtomically,
   type FaultRow,
   type InspectionRow,
   type SwitchRow,
   type WorkOrderRow,
+  type WorkOrderSaveResult,
   type YardRow,
 } from '../utils/db';
 import {
   WORK_ORDER_STATE_FLOW,
-  buildWorkOrderCode,
   type WorkOrderDraft,
   type WorkOrderState,
   type WorkOrderView,
 } from '../types/workOrder';
-import {
-  findConflicts,
-  findMachineConflicts,
-  findMemberConflicts,
-  nowDateTime,
-  windowMinutes,
-} from '../utils/window';
+import { findMachineConflicts, findMemberConflicts, windowMinutes } from '../utils/window';
 import { emitChange } from '../utils/events';
 
 export interface WorkOrderStateSlice {
@@ -83,108 +81,70 @@ export const loadWorkOrderData = createAsyncThunk<
   }
 });
 
-/** 新建作业单：把勾选病害编排进同一时间窗，并回传时间窗冲突编号 */
-export const createWorkOrder = createAsyncThunk<
-  { created: boolean; conflicts: string[] },
-  WorkOrderDraft,
-  { rejectValue: string; state: { workOrder: WorkOrderStateSlice } }
->('workOrder/create', async (draft, { getState, rejectWithValue }) => {
-  try {
-    const state = getState().workOrder;
-    const conflicts = findConflicts(
-      { id: 'pending', windowStart: draft.windowStart, windowEnd: draft.windowEnd },
-      state.workOrders.map((item) => ({
-        id: item.id,
-        code: item.code,
-        windowStart: item.windowStart,
-        windowEnd: item.windowEnd,
-      })),
-    ).map((item) => item.code);
+/** 保存作业单入参：草稿 + 页面依据的修订号（新建为 null） */
+export interface SaveWorkOrderArg {
+  draft: WorkOrderDraft;
+  id: string | null;
+  expectedRevision: number | null;
+}
 
-    await putWorkOrder({
-      id: `wo-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
-      code: draft.code.trim() || buildWorkOrderCode(new Date(), state.workOrders.length + 1),
+/** 保存 / 推进被拒绝时的结构化原因（页面据此引导合并或提示冲突来源） */
+export interface ConcurrencyReject {
+  message: string;
+  /** RevisionConflictError / FaultOccupiedError / KickbackBlockingError / Error */
+  name: string;
+}
+
+/**
+ * 新建 / 更新作业单（修订号提交）。
+ * 冲突不阻断 planned 保存，但返回被退回草稿的作业单与冲突来源供页面列出。
+ */
+export const saveWorkOrder = createAsyncThunk<
+  WorkOrderSaveResult,
+  SaveWorkOrderArg,
+  { rejectValue: ConcurrencyReject }
+>('workOrder/save', async ({ draft, id, expectedRevision }, { rejectWithValue }) => {
+  try {
+    const result = await saveWorkOrderAtomically({
+      id,
+      code: draft.code,
       faultIds: draft.faultIds,
       windowStart: draft.windowStart,
       windowEnd: draft.windowEnd,
-      leader: draft.leader.trim(),
+      leader: draft.leader,
       machines: draft.machines,
       members: draft.members,
-      state: 'planned',
-      createdAt: nowDateTime(),
-      updatedAt: nowDateTime(),
-      revision: ROW_REVISION,
+      remark: draft.remark,
+      expectedRevision,
     });
     emitChange();
-    return { created: true, conflicts };
+    return result;
   } catch (error) {
-    return rejectWithValue(error instanceof Error ? error.message : '新建作业单失败');
-  }
-});
-
-export const updateWorkOrder = createAsyncThunk<
-  void,
-  { id: string; draft: WorkOrderDraft },
-  { rejectValue: string; state: { workOrder: WorkOrderStateSlice } }
->('workOrder/update', async ({ id, draft }, { getState, rejectWithValue }) => {
-  try {
-    const state = getState().workOrder;
-    const existing = state.workOrders.find((item) => item.id === id);
-    if (!existing) return;
-    await putWorkOrder({
-      ...existing,
-      code: draft.code.trim(),
-      faultIds: draft.faultIds,
-      windowStart: draft.windowStart,
-      windowEnd: draft.windowEnd,
-      leader: draft.leader.trim(),
-      machines: draft.machines,
-      members: draft.members,
-      updatedAt: nowDateTime(),
+    return rejectWithValue({
+      message: error instanceof Error ? error.message : '保存作业单失败',
+      name: error instanceof Error ? error.name : 'Error',
     });
-    emitChange();
-  } catch (error) {
-    return rejectWithValue(error instanceof Error ? error.message : '更新作业单失败');
   }
 });
 
 /**
- * 推进作业单状态。
- * 推进到「已完成」时，把关联病害批量置为已销号（回写销号）。
+ * 推进作业单状态（修订号提交）。
+ * 推进到「已完成」时，作业单状态与关联病害销号在同一原子事务内提交。
  */
 export const advanceWorkOrder = createAsyncThunk<
   { state: WorkOrderState; solvedCount: number },
-  { id: string; next: WorkOrderState },
-  { rejectValue: string; state: { workOrder: WorkOrderStateSlice } }
->('workOrder/advance', async ({ id, next }, { getState, rejectWithValue }) => {
+  { id: string; next: WorkOrderState; expectedRevision: number },
+  { rejectValue: ConcurrencyReject }
+>('workOrder/advance', async ({ id, next, expectedRevision }, { rejectWithValue }) => {
   try {
-    const state = getState().workOrder;
-    const existing = state.workOrders.find((item) => item.id === id);
-    if (!existing) return { state: next, solvedCount: 0 };
-    const allowed = WORK_ORDER_STATE_FLOW[existing.state];
-    if (!allowed.includes(next)) return { state: existing.state, solvedCount: 0 };
-
-    let solvedCount = 0;
-    if (next === 'done') {
-      const related = state.faults.filter(
-        (item) => existing.faultIds.includes(item.id) && item.state === 'pending',
-      );
-      if (related.length > 0) {
-        await putFaults(
-          related.map((item) => ({ ...item, state: 'solved' as const, solvedAt: nowDateTime() })),
-        );
-        solvedCount = related.length;
-      }
-    }
-    await putWorkOrder({
-      ...existing,
-      state: next,
-      updatedAt: nowDateTime(),
-    });
+    const result = await advanceWorkOrderAtomically(id, next, expectedRevision);
     emitChange();
-    return { state: next, solvedCount };
+    return { state: result.order.state, solvedCount: result.solvedCount };
   } catch (error) {
-    return rejectWithValue(error instanceof Error ? error.message : '推进作业单失败');
+    return rejectWithValue({
+      message: error instanceof Error ? error.message : '推进作业单失败',
+      name: error instanceof Error ? error.name : 'Error',
+    });
   }
 });
 
@@ -269,7 +229,7 @@ export function selectWorkOrderViews(state: RootLike): WorkOrderView[] {
             .filter((name): name is string => Boolean(name)),
         ),
       ];
-      const others = workOrders.filter((item) => item.id !== order.id);
+      const others = workOrders.filter((item) => item.id !== order.id && item.state !== 'done');
       const conflictCodes = others
         .filter((item) => item.windowStart < order.windowEnd && order.windowStart < item.windowEnd)
         .map((item) => item.code);
@@ -302,18 +262,21 @@ export function selectWorkOrderViews(state: RootLike): WorkOrderView[] {
         conflictCodes,
         memberConflict: memberConflicts.length > 0,
         machineConflict: machineConflicts.length > 0,
+        kickbackSources: order.draftKickback?.sources ?? [],
         pendingFaultCount: related.filter((item) => item.state === 'pending').length,
       };
     })
     .sort((a, b) => a.windowStart.localeCompare(b.windowStart));
 }
 
-/** 待编排病害（未销号且未编排） */
+/** 待编排病害（未销号且未被未完成作业单编排） */
 export function selectPlanableFaults(state: {
   workOrder: WorkOrderStateSlice;
 }): Array<{ id: string; label: string; severity: string; state: string }> {
   const { faults, inspections, workOrders, switches } = state.workOrder;
-  const plannedIds = new Set(workOrders.flatMap((item) => item.faultIds));
+  const plannedIds = new Set(
+    workOrders.filter((item) => item.state !== 'done').flatMap((item) => item.faultIds),
+  );
   return faults
     .filter((item) => item.state === 'pending' && !plannedIds.has(item.id))
     .map((item) => {
@@ -335,6 +298,7 @@ export function selectWindowStats(state: RootLike): {
   occupationRate: number;
   conflictCount: number;
   doneCount: number;
+  kickedBackCount: number;
 } {
   const views = selectWorkOrderViews(state);
   const minutes = views.reduce((sum, item) => sum + item.durationMinutes, 0);
@@ -344,5 +308,9 @@ export function selectWindowStats(state: RootLike): {
     occupationRate: Number(((minutes / 180) * 100).toFixed(1)),
     conflictCount: views.filter((item) => item.conflict).length,
     doneCount: views.filter((item) => item.state === 'done').length,
+    kickedBackCount: views.filter((item) => item.draftKickback !== null).length,
   };
 }
+
+/** 流转规则导出，页面据此渲染推进按钮 */
+export { WORK_ORDER_STATE_FLOW };

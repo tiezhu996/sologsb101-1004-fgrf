@@ -29,7 +29,7 @@ import CheckCircleIcon from '@mui/icons-material/CheckCircle';
 import AssignmentTurnedInIcon from '@mui/icons-material/AssignmentTurnedIn';
 import DownloadIcon from '@mui/icons-material/Download';
 import { useAppDispatch, useAppSelector } from '../hooks/useAppStore';
-import { advanceWorkOrder, selectWindowStats, selectWorkOrderViews } from '../stores/workOrderStore';
+import { advanceWorkOrder, selectWindowStats, selectWorkOrderViews, type ConcurrencyReject } from '../stores/workOrderStore';
 import { selectFaultViews } from '../stores/faultStore';
 import {
   WORK_ORDER_STATE_FLOW,
@@ -97,16 +97,25 @@ export default function ProgressView() {
     };
   }, [orders, faults]);
 
-  const advance = async (id: string, next: WorkOrderState, code: string): Promise<void> => {
+  const advance = async (order: { id: string; revision: number }, next: WorkOrderState, code: string): Promise<void> => {
     try {
-      const result = await dispatch(advanceWorkOrder({ id, next })).unwrap();
+      const result = await dispatch(
+        advanceWorkOrder({ id: order.id, next, expectedRevision: order.revision }),
+      ).unwrap();
       if (next === 'done') {
-        setToast(`${code} 已完成，回写销号 ${result.solvedCount} 处病害`);
+        setToast(`${code} 已完成，状态与 ${result.solvedCount} 处病害销号已在同一次提交里写入`);
       } else {
         setToast(`${code} 已推进为「${WORK_ORDER_STATE_LABEL[next]}」`);
       }
     } catch (error) {
-      setToast(`推进失败：${error instanceof Error ? error.message : '未知错误'}`);
+      const reject = error as ConcurrencyReject;
+      if (reject?.name === 'RevisionConflictError') {
+        setToast(`推进被拦住：${reject.message}，页面将刷新为最新版本，请重新操作`);
+      } else if (reject?.name === 'KickbackBlockingError') {
+        setToast(`不能下达：${reject.message}`);
+      } else {
+        setToast(`推进失败：${reject?.message ?? '未知错误'}（数据未改动，无半成品）`);
+      }
     }
   };
 
@@ -249,6 +258,15 @@ export default function ProgressView() {
                             <Chip size="small" color="error" label="时间窗冲突" />
                           </Tooltip>
                         ) : null}
+                        {order.draftKickback ? (
+                          <Tooltip
+                            title={order.kickbackSources
+                              .map((source) => `${source.reason} ← ${source.target}（${source.detail}）`)
+                              .join('；')}
+                          >
+                            <Chip size="small" color="error" label="退回草稿待处理" />
+                          </Tooltip>
+                        ) : null}
                         <Chip size="small" variant="outlined" label={`负责人 ${order.leader}`} />
                       </Stack>
                       <Typography variant="caption" color="text.secondary" display="block" mt={0.5}>
@@ -257,18 +275,22 @@ export default function ProgressView() {
                       </Typography>
                     </Box>
                     <Stack direction="row" spacing={1} flexWrap="wrap" useFlexGap>
-                      {nextStates.map((next) => (
-                        <Button
-                          key={next}
-                          size="small"
-                          variant={next === 'done' ? 'contained' : 'outlined'}
-                          color={next === 'done' ? 'success' : 'primary'}
-                          startIcon={next === 'done' ? <AssignmentTurnedInIcon /> : <PlayArrowIcon />}
-                          onClick={() => void advance(order.id, next, order.code)}
-                        >
-                          推进为{WORK_ORDER_STATE_LABEL[next]}
-                        </Button>
-                      ))}
+                      {nextStates.map((next) => {
+                        const blockedByKickback = next === 'issued' && order.draftKickback !== null;
+                        return (
+                          <Button
+                            key={next}
+                            size="small"
+                            variant={next === 'done' ? 'contained' : 'outlined'}
+                            color={next === 'done' ? 'success' : 'primary'}
+                            startIcon={next === 'done' ? <AssignmentTurnedInIcon /> : <PlayArrowIcon />}
+                            disabled={blockedByKickback}
+                            onClick={() => void advance(order, next, order.code)}
+                          >
+                            {blockedByKickback ? '有退回冲突，不能下达' : `推进为${WORK_ORDER_STATE_LABEL[next]}`}
+                          </Button>
+                        );
+                      })}
                       {order.state === 'done' ? (
                         <Chip icon={<CheckCircleIcon />} color="success" label="已完成并回写销号" />
                       ) : null}
@@ -351,8 +373,9 @@ export default function ProgressView() {
       </Box>
 
       <Alert severity="info" sx={{ mt: 2 }}>
-        说明：天窗作业单推进到「已完成」时，系统会把该单关联的全部待修病害一次性置为已销号并记录销号时间，
-        可在「病害评定与销号」页撤销销号。
+        说明：天窗作业单推进到「已完成」时，作业单状态与该单关联病害的销号会在<strong>同一次原子提交</strong>里写入；
+        若中途写入失败或浏览器崩溃，重新打开会按提交前快照完整恢复，不会留下「状态已完成但病害没销号」之类的半成品。
+        带「退回草稿待处理」标记的作业单需先回编排台消除冲突并重新保存，才能下达。
       </Alert>
 
       <Snackbar

@@ -10,19 +10,49 @@ import type { Yard } from '../types/yard';
 import type { Switch } from '../types/switch';
 import type { Inspection } from '../types/inspection';
 import type { Fault } from '../types/fault';
-import type { WorkOrder } from '../types/workOrder';
+import type { WorkOrder, WorkOrderKickback } from '../types/workOrder';
 import { ROW_REVISION, type Revisioned } from '../types/persistence';
 import { nowDateTime, shiftDate, todayDate, windowMinutes } from './window';
 import { nowIso, uuid } from './format';
+import { conflictSources, type OrderLike } from './orchestration';
+import { atomicCommit, recoverPendingCommits } from './atomicCommit';
+import {
+  FaultOccupiedError,
+  KickbackBlockingError,
+  RevisionConflictError,
+} from './concurrency';
 
 /** 浏览器 IndexedDB 库名 */
 export const DB_NAME = 'gbrailswitch';
 
 /** 当前数据结构版本号（每次调整字段结构必须 +1 并补迁移） */
-export const DB_SCHEMA_VERSION = 2;
+export const DB_SCHEMA_VERSION = 3;
 
 export { ROW_REVISION };
 export type { Revisioned };
+
+/** 业务表名（供原子提交按表恢复镜像） */
+export type TableName =
+  | 'yards'
+  | 'switches'
+  | 'inspections'
+  | 'faults'
+  | 'workOrders'
+  | 'restrictions';
+
+/** 未完成提交的 WAL 日志行 */
+export interface PendingCommitRow {
+  id: string;
+  /** 提交类别（如 workOrder.complete） */
+  kind: string;
+  /** 提交前镜像（表名 + id + 旧整行） */
+  before: Array<{
+    table: TableName;
+    id: string;
+    row: Record<string, unknown> | null;
+  }>;
+  createdAt: string;
+}
 
 /** 封锁 / 慢行条件登记（/backup 页） */
 export interface SpeedRestriction extends Revisioned {
@@ -55,6 +85,8 @@ class RailSwitchDatabase extends Dexie {
   workOrders!: Table<WorkOrderRow, string>;
   restrictions!: Table<SpeedRestrictionRow, string>;
   settings!: Table<{ id: string; value: string; updatedAt: string }, string>;
+  /** 原子提交 WAL：作业单完成（状态 + 销号）的提交前镜像 */
+  pendingCommits!: Table<PendingCommitRow, string>;
 
   constructor() {
     super(DB_NAME);
@@ -70,7 +102,7 @@ class RailSwitchDatabase extends Dexie {
 
     // v2：新增 revision 行修订号；道岔补充轨型索引，病害补充组合索引便于按巡检批量操作，
     //     作业单补充负责人索引，并新增封锁条件表
-    this.version(DB_SCHEMA_VERSION)
+    this.version(2)
       .stores({
         yards: 'id, name, region, mileage',
         switches: 'id, yardId, code, frogNumber, railType, [yardId+code]',
@@ -112,6 +144,28 @@ class RailSwitchDatabase extends Dexie {
           if (!Array.isArray(row.members)) row.members = [];
           if (!Array.isArray(row.machines)) row.machines = [];
         });
+      });
+
+    // v3：作业单补充备注与退回草稿记录；新增 pendingCommits 原子提交日志表
+    this.version(DB_SCHEMA_VERSION)
+      .stores({
+        yards: 'id, name, region, mileage',
+        switches: 'id, yardId, code, frogNumber, railType, [yardId+code]',
+        inspections: 'id, switchId, date, inspector, [switchId+date]',
+        faults: 'id, inspectionId, part, severity, state, [inspectionId+part]',
+        workOrders: 'id, code, state, windowStart, leader',
+        restrictions: 'id, yardId, switchCode',
+        settings: 'id',
+        pendingCommits: 'id, kind, createdAt',
+      })
+      .upgrade(async (tx) => {
+        await tx
+          .table('workOrders')
+          .toCollection()
+          .modify((row: Record<string, unknown>) => {
+            if (typeof row.remark !== 'string') row.remark = '';
+            if (row.draftKickback === undefined) row.draftKickback = null;
+          });
       });
   }
 }
@@ -304,7 +358,9 @@ async function seedDatabase(): Promise<void> {
       leader: group.leader,
       machines: index === 0 ? ['轨距尺', '钢轨打磨机', '扭矩扳手'] : ['道尺', '捣固镐'],
       members: index === 0 ? ['赵铁军', '孙立波'] : index === 1 ? ['孙立波', '郑小勇'] : ['周振海', '冯国栋'],
+      remark: '',
       state: group.state,
+      draftKickback: null,
       createdAt: stamp,
       updatedAt: stamp,
       revision: ROW_REVISION,
@@ -350,13 +406,24 @@ async function seedDatabase(): Promise<void> {
 
 /* ============================== 初始化 ============================== */
 
-/** 打开数据库；站场表为空时播种演示数据（幂等） */
+/** 打开数据库；站场表为空时播种演示数据（幂等）；启动时回滚残留的半成品提交 */
 export async function initDatabase(): Promise<void> {
   await db.open();
+  // 上次作业单完成提交若在中途失败 / 崩溃，按 WAL 镜像恢复到提交前的完整状态
+  await recoverPendingCommits();
+  await normalizeWorkOrders();
   const count = await db.yards.count();
   if (count === 0) {
     await seedDatabase();
   }
+}
+
+/** 补齐历史作业单行缺失的 v3 字段（remark / draftKickback） */
+async function normalizeWorkOrders(): Promise<void> {
+  await db.workOrders.toCollection().modify((row) => {
+    if (typeof row.remark !== 'string') row.remark = '';
+    if (row.draftKickback === undefined) row.draftKickback = null;
+  });
 }
 
 /* ============================== 站场 ============================== */
@@ -392,7 +459,7 @@ export async function removeYard(id: string): Promise<void> {
           const remaining = order.faultIds.filter((faultId) => !faultIds.has(faultId));
           if (remaining.length !== order.faultIds.length) {
             if (remaining.length === 0) await db.workOrders.delete(order.id);
-            else await db.workOrders.put({ ...order, faultIds: remaining, updatedAt: nowIso() });
+            else await db.workOrders.put({ ...order, faultIds: remaining, updatedAt: nowIso(), revision: order.revision + 1 });
           }
         }
       }
@@ -432,7 +499,7 @@ export async function removeSwitch(id: string): Promise<void> {
         const remaining = order.faultIds.filter((faultId) => !faultIds.has(faultId));
         if (remaining.length !== order.faultIds.length) {
           if (remaining.length === 0) await db.workOrders.delete(order.id);
-          else await db.workOrders.put({ ...order, faultIds: remaining, updatedAt: nowIso() });
+          else await db.workOrders.put({ ...order, faultIds: remaining, updatedAt: nowIso(), revision: order.revision + 1 });
         }
       }
       await db.faults.where('inspectionId').anyOf(inspectionIds).delete();
@@ -463,7 +530,7 @@ export async function removeInspection(id: string): Promise<void> {
       const remaining = order.faultIds.filter((faultId) => !faultIds.has(faultId));
       if (remaining.length !== order.faultIds.length) {
         if (remaining.length === 0) await db.workOrders.delete(order.id);
-        else await db.workOrders.put({ ...order, faultIds: remaining, updatedAt: nowIso() });
+        else await db.workOrders.put({ ...order, faultIds: remaining, updatedAt: nowIso(), revision: order.revision + 1 });
       }
     }
     await db.faults.where('inspectionId').equals(id).delete();
@@ -492,7 +559,7 @@ export async function removeFault(id: string): Promise<void> {
       if (!order.faultIds.includes(id)) continue;
       const remaining = order.faultIds.filter((faultId) => faultId !== id);
       if (remaining.length === 0) await db.workOrders.delete(order.id);
-      else await db.workOrders.put({ ...order, faultIds: remaining, updatedAt: nowIso() });
+      else await db.workOrders.put({ ...order, faultIds: remaining, updatedAt: nowIso(), revision: order.revision + 1 });
     }
     await db.faults.delete(id);
   });
@@ -510,7 +577,305 @@ export async function putWorkOrder(row: WorkOrderRow): Promise<void> {
 }
 
 export async function removeWorkOrder(id: string): Promise<void> {
-  await db.workOrders.delete(id);
+  await db.transaction('rw', db.workOrders, async () => {
+    await db.workOrders.delete(id);
+    // 冲突来源被删除后，重算剩余「待编排」作业单的退回草稿标记：冲突已消失的自动解除
+    const remaining = await db.workOrders.toArray();
+    const stamp = nowDateTime();
+    for (const order of remaining) {
+      if (order.state !== 'planned' || !order.draftKickback) continue;
+      const sources = conflictSources(
+        toOrderLike(order),
+        remaining.filter((item) => item.id !== order.id).map(toOrderLike),
+      );
+      if (sources.length === 0) {
+        await db.workOrders.put({ ...order, draftKickback: null, updatedAt: stamp, revision: order.revision + 1 });
+      }
+    }
+  });
+}
+
+/* ===================== 作业单原子编排保存（修订号提交） ===================== */
+
+/** 作业单保存入参：表单内容 + 页面依据的修订号（新建时为 null） */
+export interface WorkOrderSaveInput {
+  id: string | null;
+  code: string;
+  faultIds: string[];
+  windowStart: string;
+  windowEnd: string;
+  leader: string;
+  machines: string[];
+  members: string[];
+  remark: string;
+  /** 打开编辑时读到的作业单修订号；与库内不一致即拒绝写入（乐观锁） */
+  expectedRevision: number | null;
+}
+
+/** 保存成功结果：最新行 + 本次计算出的冲突来源（供页面提示，但不阻断 planned 保存） */
+export interface WorkOrderSaveResult {
+  order: WorkOrderRow;
+  /** 本次表单对其它未下达作业单造成的新冲突（时间窗 / 人员 / 机具） */
+  kickedBack: Array<{ id: string; code: string; sources: WorkOrderKickback['sources'] }>;
+}
+
+/** 把 WorkOrder 转成冲突计算结构 */
+function toOrderLike(order: WorkOrderRow): OrderLike {
+  return {
+    id: order.id,
+    code: order.code,
+    state: order.state,
+    windowStart: order.windowStart,
+    windowEnd: order.windowEnd,
+    members: order.members,
+    machines: order.machines,
+  };
+}
+
+/**
+ * 原子保存作业单（新建 / 编辑）。
+ * 同一个 IndexedDB 读写事务内完成：
+ * 1. 修订号核对：编辑提交必须与最新行修订号一致，否则抛 RevisionConflictError；
+ * 2. 病害占用校验：待修病害已被其它作业单（含已下达 / 作业中 / 已完成未销号）占用则拦截；
+ * 3. 写入目标作业单（修订号 +1）；
+ * 4. 受本次时间窗 / 人员 / 机具变化影响、且状态为 planned 的其它作业单退回草稿，
+ *    并在 draftKickback 记录冲突来源（编号 + 原因 + 明细）。
+ */
+export async function saveWorkOrderAtomically(input: WorkOrderSaveInput): Promise<WorkOrderSaveResult> {
+  const result = await db.transaction('rw', [db.workOrders, db.faults], async () => {
+    const allOrders = await db.workOrders.toArray();
+    const targetId = input.id ?? undefined;
+    const existing = targetId ? allOrders.find((item) => item.id === targetId) ?? null : null;
+
+    // 1) 修订号乐观锁
+    if (existing && input.expectedRevision !== null && existing.revision !== input.expectedRevision) {
+      throw new RevisionConflictError(
+        'workOrders',
+        existing.id,
+        input.expectedRevision,
+        existing.revision,
+      );
+    }
+
+    // 2) 病害占用：一个病害只能编进一张未完成作业单
+    if (input.faultIds.length > 0) {
+      const occupant = allOrders.find(
+        (order) =>
+          order.id !== targetId &&
+          order.state !== 'done' &&
+          input.faultIds.some((faultId) => order.faultIds.includes(faultId)),
+      );
+      if (occupant) {
+        const occupiedId = input.faultIds.find((faultId) => occupant.faultIds.includes(faultId));
+        throw new FaultOccupiedError(occupiedId ?? input.faultIds[0], occupant.code);
+      }
+    }
+
+    const stamp = nowDateTime();
+    const nextOrder: WorkOrderRow = existing
+      ? {
+          ...existing,
+          code: input.code.trim() || existing.code,
+          faultIds: input.faultIds,
+          windowStart: input.windowStart,
+          windowEnd: input.windowEnd,
+          leader: input.leader.trim(),
+          machines: input.machines,
+          members: input.members,
+          remark: input.remark,
+          updatedAt: stamp,
+          revision: existing.revision + 1,
+          // 本次保存重新计算冲突；仍有冲突时更新来源，无冲突则清除退回标记
+          draftKickback: existing.draftKickback,
+        }
+      : {
+          id: `wo-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
+          code: input.code.trim(),
+          faultIds: input.faultIds,
+          windowStart: input.windowStart,
+          windowEnd: input.windowEnd,
+          leader: input.leader.trim(),
+          machines: input.machines,
+          members: input.members,
+          remark: input.remark,
+          state: 'planned',
+          draftKickback: null,
+          createdAt: stamp,
+          updatedAt: stamp,
+          revision: 1,
+        };
+
+    // 3) 用「保存后」的全量视图计算冲突，先落目标单再评估其它单
+    const prospective = existing
+      ? allOrders.map((item) => (item.id === existing.id ? nextOrder : item))
+      : [...allOrders, nextOrder];
+
+    const targetLike = toOrderLike(nextOrder);
+
+    // 目标单自身的冲突：仍冲突则挂来源（保持在草稿，等人工处理）；不冲突则清标记
+    const selfSources = conflictSources(
+      targetLike,
+      prospective.filter((item) => item.id !== nextOrder.id).map(toOrderLike),
+    );
+    nextOrder.draftKickback = selfSources.length > 0 ? { sources: selfSources, at: stamp } : null;
+
+    // 4) 其它「待编排（未下达）」作业单：本次保存给其引入了与目标单的新冲突 → 退回草稿并记录来源；
+    //    本次保存反而消除了冲突 → 清掉退回标记。
+    const kickedBack: WorkOrderSaveResult['kickedBack'] = [];
+    const ordersToPut: WorkOrderRow[] = [];
+    for (const order of allOrders) {
+      if (order.id === nextOrder.id || order.state !== 'planned') continue;
+      // 保存前该单与其它单（不含目标单的新内容）的冲突来源
+      const beforeView = allOrders.filter((item) => item.id !== order.id && item.id !== nextOrder.id);
+      const beforeSources = conflictSources(toOrderLike(order), beforeView.map(toOrderLike));
+      const beforeKeys = new Set(beforeSources.map((source) => `${source.reason}@${source.target}@${source.detail}`));
+      // 保存后该单在全量视图下的冲突来源
+      const afterPeers = prospective.filter((item) => item.id !== order.id).map(toOrderLike);
+      const afterSources = conflictSources(toOrderLike({ ...order, draftKickback: null }), afterPeers);
+      const afterKeys = new Set(afterSources.map((source) => `${source.reason}@${source.target}@${source.detail}`));
+      const introduced = afterSources.filter(
+        (source) => source.target === nextOrder.code && !beforeKeys.has(`${source.reason}@${source.target}@${source.detail}`),
+      );
+      const hadKickback = order.draftKickback !== null;
+
+      if (introduced.length > 0) {
+        // 受本次时间窗 / 人员 / 机具变化影响：退回草稿，列出全部现存冲突来源
+        ordersToPut.push({
+          ...order,
+          draftKickback: { sources: afterSources, at: stamp },
+          updatedAt: stamp,
+          revision: order.revision + 1,
+        });
+        kickedBack.push({ id: order.id, code: order.code, sources: afterSources });
+      } else if (afterSources.length === 0 && hadKickback) {
+        // 冲突已全部消除：自动清除退回标记
+        ordersToPut.push({
+          ...order,
+          draftKickback: null,
+          updatedAt: stamp,
+          revision: order.revision + 1,
+        });
+      } else if (hadKickback && beforeKeys.size !== afterKeys.size) {
+        // 冲突集合有增减但与本单无关：仅刷新来源，不计入本次退回清单
+        ordersToPut.push({
+          ...order,
+          draftKickback: { sources: afterSources, at: stamp },
+          updatedAt: stamp,
+          revision: order.revision + 1,
+        });
+      }
+    }
+
+    for (const order of ordersToPut) {
+      await db.workOrders.put(order);
+    }
+    await db.workOrders.put(nextOrder);
+
+    return { order: nextOrder, kickedBack };
+  });
+
+  return result;
+}
+
+/** 读取单张作业单最新版本（重开 / 切回页面时合并用） */
+export async function getWorkOrder(id: string): Promise<WorkOrderRow | null> {
+  return (await db.workOrders.get(id)) ?? null;
+}
+
+/**
+ * 推进作业单状态（修订号提交）。
+ * - 带未处理退回草稿冲突的 planned 单不能下达（抛 KickbackBlockingError）；
+ * - 修订号不一致抛 RevisionConflictError；
+ * - 推进到「已完成」时，作业单状态与涉及病害销号在同一个原子事务里写入，
+ *   任一步失败都按提交前镜像完整回滚（见 atomicCommit），不留半成品。
+ */
+export async function advanceWorkOrderAtomically(
+  id: string,
+  next: WorkOrderRow['state'],
+  expectedRevision: number,
+): Promise<{ order: WorkOrderRow; solvedCount: number }> {
+  // 先读最新行做规则校验（在原子事务内再核对一次，防止读后被改）
+  const beforeOrder = await db.workOrders.get(id);
+  if (!beforeOrder) throw new Error('作业单不存在或已被其它页面删除');
+  if (beforeOrder.revision !== expectedRevision) {
+    throw new RevisionConflictError('workOrders', id, expectedRevision, beforeOrder.revision);
+  }
+  if (next === 'issued' && beforeOrder.state === 'planned' && beforeOrder.draftKickback) {
+    throw new KickbackBlockingError();
+  }
+
+  const stamp = nowDateTime();
+
+  if (next !== 'done') {
+    return await db.transaction('rw', db.workOrders, async () => {
+      const current = await db.workOrders.get(id);
+      if (!current) throw new Error('作业单不存在或已被其它页面删除');
+      if (current.revision !== expectedRevision) {
+        throw new RevisionConflictError('workOrders', id, expectedRevision, current.revision);
+      }
+      if (next === 'issued' && current.state === 'planned' && current.draftKickback) {
+        throw new KickbackBlockingError();
+      }
+      const updated: WorkOrderRow = {
+        ...current,
+        state: next,
+        updatedAt: stamp,
+        revision: current.revision + 1,
+      };
+      await db.workOrders.put(updated);
+      return { order: updated, solvedCount: 0 };
+    });
+  }
+
+  // 完成：作业单状态 + 病害销号在同一次提交里落库，WAL 保证崩溃后恢复提交前状态
+  const relatedFaults = await db.faults.where('id').anyOf(beforeOrder.faultIds).toArray();
+  const pendingFaults = relatedFaults.filter((item) => item.state === 'pending');
+  const beforeImages = [
+    { table: 'workOrders' as const, id: beforeOrder.id, row: { ...beforeOrder } as unknown as Record<string, unknown> },
+    ...pendingFaults.map((fault) => ({
+      table: 'faults' as const,
+      id: fault.id,
+      row: { ...fault } as unknown as Record<string, unknown>,
+    })),
+  ];
+
+  let solvedCount = 0;
+  await atomicCommit({
+    kind: 'workOrder.complete',
+    before: beforeImages,
+    mutate: async () => {
+      await db.transaction('rw', [db.workOrders, db.faults], async () => {
+        const current = await db.workOrders.get(id);
+        if (!current) throw new Error('作业单不存在或已被其它页面删除');
+        if (current.revision !== expectedRevision) {
+          throw new RevisionConflictError('workOrders', id, expectedRevision, current.revision);
+        }
+        // 关联病害可能在别的页面已销号 / 变化：只把仍是待修的置为已销号
+        const latestFaults = await db.faults.where('id').anyOf(current.faultIds).toArray();
+        const toSolve = latestFaults.filter((item) => item.state === 'pending');
+        for (const fault of toSolve) {
+          await db.faults.put({
+            ...fault,
+            state: 'solved',
+            solvedAt: stamp,
+            revision: fault.revision + 1,
+          });
+        }
+        solvedCount = toSolve.length;
+        const doneOrder: WorkOrderRow = {
+          ...current,
+          state: 'done',
+          updatedAt: stamp,
+          revision: current.revision + 1,
+        };
+        await db.workOrders.put(doneOrder);
+      });
+    },
+  });
+
+  const finalOrder = await db.workOrders.get(id);
+  if (!finalOrder) throw new Error('提交后作业单丢失');
+  return { order: finalOrder, solvedCount };
 }
 
 /* =========================== 封锁 / 慢行条件 =========================== */
@@ -564,10 +929,20 @@ export async function exportSnapshot(): Promise<DatabaseSnapshot> {
   };
 }
 
+/** 导入快照中的作业单补齐 v3 字段，避免旧备份缺字段 */
+function normalizeImportedWorkOrder(order: WorkOrderRow): WorkOrderRow {
+  return {
+    ...order,
+    remark: typeof order.remark === 'string' ? order.remark : '',
+    draftKickback: order.draftKickback ?? null,
+    revision: typeof order.revision === 'number' ? order.revision : 1,
+  };
+}
+
 export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> {
   await db.transaction(
     'rw',
-    [db.yards, db.switches, db.inspections, db.faults, db.workOrders, db.restrictions],
+    [db.yards, db.switches, db.inspections, db.faults, db.workOrders, db.restrictions, db.pendingCommits],
     async () => {
       await Promise.all([
         db.yards.clear(),
@@ -576,12 +951,13 @@ export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> 
         db.faults.clear(),
         db.workOrders.clear(),
         db.restrictions.clear(),
+        db.pendingCommits.clear(),
       ]);
       await db.yards.bulkPut(snapshot.yards ?? []);
       await db.switches.bulkPut(snapshot.switches ?? []);
       await db.inspections.bulkPut(snapshot.inspections ?? []);
       await db.faults.bulkPut(snapshot.faults ?? []);
-      await db.workOrders.bulkPut(snapshot.workOrders ?? []);
+      await db.workOrders.bulkPut((snapshot.workOrders ?? []).map(normalizeImportedWorkOrder));
       await db.restrictions.bulkPut(snapshot.restrictions ?? []);
     },
   );
@@ -591,7 +967,7 @@ export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> 
 export async function resetDatabase(): Promise<void> {
   await db.transaction(
     'rw',
-    [db.yards, db.switches, db.inspections, db.faults, db.workOrders, db.restrictions],
+    [db.yards, db.switches, db.inspections, db.faults, db.workOrders, db.restrictions, db.pendingCommits],
     async () => {
       await Promise.all([
         db.yards.clear(),
@@ -600,6 +976,7 @@ export async function resetDatabase(): Promise<void> {
         db.faults.clear(),
         db.workOrders.clear(),
         db.restrictions.clear(),
+        db.pendingCommits.clear(),
       ]);
     },
   );
